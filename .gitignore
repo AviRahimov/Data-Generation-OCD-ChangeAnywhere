@@ -1,0 +1,67 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Workspace generated data
+# Synthetic tiles and generated images
+src/data/
+
+# Model weights
+*.pth
+*.pt
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Python notebook checkpoints
+.ipynb_checkpoints/
+
+# Misc
+*.bak
+*~
+
+# Ignore local secret tokens
+.env
+
+# End of .gitignore
+

@@ -1,0 +1,35 @@
+# Configuration for ChangeAnywhere-style pipeline
+data:
+  raw_root: "src/data/original_OCD_dataset"
+  work_root: "src/data/workspace"
+  tiles_dir: "{work_root}/tiles"
+  masks_dir: "{work_root}/masks"
+  synthetic_dir: "{work_root}/synthetic"
+  dataset_dir: "{work_root}/dataset"
+
+tiling:
+  tile_size: 512
+  overlap: 64
+  min_nonempty_ratio: 0.02  # drop tiles that are mostly empty (fraction of non-background pixels)
+
+segmentation:
+  active_model: "sam"  # options: sam, segformer, fallback
+  fallback:
+    slic_segments: 200
+  segformer:
+    checkpoint: "nvidia/segformer-b5-finetuned-ade-640-640"
+    device: "cuda"
+  sam:
+    model_type: "sam3.1"
+    checkpoint: ""
+    device: "cuda"
+
+synthetic:
+  max_modified_segments: 5
+  color_jitter: 0.25  # fraction to change brightness
+
+logging:
+  level: INFO
+
+testing:
+  test_pair: "pair_0000"

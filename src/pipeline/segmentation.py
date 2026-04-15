@@ -103,13 +103,24 @@ def get_segmentation_model(name, cfg=None):
 
     if name == 'sam':
         from .sam_integration import SAMModel
-        checkpoint = ""
-        model_type = "sam3.1"
+        checkpoint = "SAM3"
         device = "cuda"
+        score_threshold = 0.10
+        mask_threshold = 0.5
+        prompts = None
         if cfg and cfg.get('sam'):
-            checkpoint = cfg['sam'].get('checkpoint', checkpoint)
-            model_type = cfg['sam'].get('model_type', model_type)
-            device = cfg['sam'].get('device', device)
-        return SAMModel(checkpoint=checkpoint, model_type=model_type, device=device)
+            sam_cfg = cfg['sam']
+            checkpoint = sam_cfg.get('checkpoint', checkpoint)
+            device = sam_cfg.get('device', device)
+            score_threshold = sam_cfg.get('score_threshold', score_threshold)
+            mask_threshold = sam_cfg.get('mask_threshold', mask_threshold)
+            prompts = sam_cfg.get('prompts', prompts)
+        return SAMModel(
+            checkpoint=checkpoint,
+            device=device,
+            score_threshold=score_threshold,
+            mask_threshold=mask_threshold,
+            prompts=prompts,
+        )
 
     raise ValueError(f'Unknown segmentation model: {name}')

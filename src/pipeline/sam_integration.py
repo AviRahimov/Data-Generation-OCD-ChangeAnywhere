@@ -1,43 +1,96 @@
+import sys
 import numpy as np
 from PIL import Image
 
 try:
     import torch
-    # Import SAM dependencies here based on your actual library
-    # For SAM 2/3.1 you might use a specific repository
-    from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+    from transformers import Sam3Model, Sam3Processor as HFSam3Processor
     SAM_AVAILABLE = True
 except ImportError:
     SAM_AVAILABLE = False
 
 
 class SAMModel:
-    def __init__(self, checkpoint="", model_type="sam3.1", device="cuda"):
+    """SAM 3 segmentation using the HuggingFace Transformers local checkpoint.
+
+    Runs text-prompted instance segmentation with multiple class prompts,
+    then merges all detected masks into a single integer segmentation map.
+    """
+
+    DEFAULT_PROMPTS = [
+        "tree", "bush", "vegetation", "road", "car", "building",
+        "house", "ground", "fence", "pole", "sidewalk", "dirt",
+    ]
+
+    def __init__(self, checkpoint="SAM3", device="cuda",
+                 prompts=None, score_threshold=0.10, mask_threshold=0.5,
+                 **kwargs):
         if not SAM_AVAILABLE:
-            raise RuntimeError("Segment Anything is not installed. Please install it.")
+            raise RuntimeError(
+                "SAM 3 requires: pip install transformers torch\n"
+                "And a local SAM3 model folder."
+            )
 
         if device == "cuda" and not torch.cuda.is_available():
-            import sys
-            print("CUDA is not available. Falling back to CPU.", file=sys.stderr)
+            print("CUDA not available, falling back to CPU.", file=sys.stderr)
             device = "cpu"
 
         self.device = device
-        # Note: change sam_model_registry according to the actual package of SAM 3.1
-        sam = sam_model_registry[model_type](checkpoint=checkpoint)
-        sam.to(device=self.device)
-        self.mask_generator = SamAutomaticMaskGenerator(sam)
+        self.score_threshold = score_threshold
+        self.mask_threshold = mask_threshold
+        self.prompts = prompts or self.DEFAULT_PROMPTS
+
+        self.model = Sam3Model.from_pretrained(
+            checkpoint, torch_dtype=torch.float16
+        ).to(device).eval()
+        self.processor = HFSam3Processor.from_pretrained(checkpoint)
+
+    @torch.inference_mode()
+    def _run_prompt(self, pil_image, prompt):
+        """Run a single text prompt and return (masks_bool, scores, label)."""
+        inputs = self.processor(images=pil_image, text=prompt, return_tensors="pt")
+        inputs = {k: v.to(self.device) if hasattr(v, "to") else v
+                  for k, v in inputs.items()}
+
+        outputs = self.model(**inputs)
+
+        target_sizes = [pil_image.size[::-1]]
+        results = self.processor.post_process_instance_segmentation(
+            outputs,
+            threshold=self.score_threshold,
+            mask_threshold=self.mask_threshold,
+            target_sizes=target_sizes,
+        )
+        return results[0]["masks"], results[0]["scores"], prompt
 
     def segment(self, pil_image):
-        arr = np.array(pil_image)
-        masks = self.mask_generator.generate(arr)
+        """Segment all objects using multiple text prompts.
 
-        # Sort masks by area to overlay smaller masks on top of larger ones
-        sorted_masks = sorted(masks, key=lambda x: x['area'], reverse=True)
+        Returns an integer mask (H, W) where each pixel gets a unique
+        segment ID (1-indexed); background is 0.
+        """
+        h, w = pil_image.size[1], pil_image.size[0]
+        all_masks = []
+        all_scores = []
 
-        seg = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.int32)
-        for i, mask in enumerate(sorted_masks):
-            # assign a unique integer to each mask (1-indexed, background is 0)
-            seg[mask['segmentation']] = i + 1
+        for prompt in self.prompts:
+            masks, scores, _ = self._run_prompt(pil_image, prompt)
+            for m, s in zip(masks, scores):
+                m_np = m.cpu().numpy().astype(bool)
+                area_ratio = m_np.sum() / (h * w)
+                if area_ratio < 0.0005 or area_ratio > 0.95:
+                    continue
+                all_masks.append(m_np)
+                all_scores.append(float(s.cpu()))
+
+        if not all_masks:
+            return np.zeros((h, w), dtype=np.int32)
+
+        order = sorted(range(len(all_masks)),
+                       key=lambda i: all_masks[i].sum(), reverse=True)
+
+        seg = np.zeros((h, w), dtype=np.int32)
+        for rank, idx in enumerate(order):
+            seg[all_masks[idx]] = rank + 1
 
         return seg
-

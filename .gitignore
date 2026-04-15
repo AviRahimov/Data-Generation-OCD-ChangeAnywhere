@@ -35,6 +35,14 @@ src/data/
 # Model weights
 *.pth
 *.pt
+*.safetensors
+*.ckpt
+*.bin
+
+# Local model folders
+SAM3/
+segformer-b5-finetuned-ade-640-640/
+stable-diffusion-2-inpainting/
 
 # Logs and databases
 *.log

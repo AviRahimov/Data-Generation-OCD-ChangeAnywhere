@@ -10,23 +10,34 @@ data:
 tiling:
   tile_size: 512
   overlap: 64
-  min_nonempty_ratio: 0.02  # drop tiles that are mostly empty (fraction of non-background pixels)
+  min_nonempty_ratio: 0.02
 
 segmentation:
-  active_model: "sam"  # options: sam, segformer, fallback
+  active_model: "segformer"  # segformer for consistent ADE20K class IDs (needed by change simulator)
   fallback:
     slic_segments: 200
   segformer:
-    checkpoint: "nvidia/segformer-b5-finetuned-ade-640-640"
+    checkpoint: "segformer-b5-finetuned-ade-640-640"
     device: "cuda"
   sam:
-    model_type: "sam3.1"
-    checkpoint: ""
+    checkpoint: "SAM3"
     device: "cuda"
+    score_threshold: 0.10
+    mask_threshold: 0.5
+
+inpainting:
+  model_id: "stable-diffusion-2-inpainting"
+  device: "cuda"
+  num_inference_steps: 50
+  guidance_scale: 20.0
+  strength: 1.0
 
 synthetic:
-  max_modified_segments: 5
-  color_jitter: 0.25  # fraction to change brightness
+  max_per_tile: 2          # change variants per tile
+  appearance_prob: 0.85    # 85% appearance, 15% disappearance
+  ssim_min: 0.4            # discard if after is too different from before
+  ssim_max: 0.99           # discard if nothing changed
+  seed: 42
 
 logging:
   level: INFO

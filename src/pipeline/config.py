@@ -16,6 +16,7 @@ class Config:
                 self.data[k] = self.data[k].format(work_root=work_root)
         self.tiling = raw.get('tiling', {})
         self.segmentation = raw.get('segmentation', {})
+        self.inpainting = raw.get('inpainting', {})
         self.synthetic = raw.get('synthetic', {})
         self.logging = raw.get('logging', {})
 

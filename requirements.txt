@@ -3,6 +3,7 @@ PyYAML>=6.0
 Pillow>=10.0.0
 numpy>=1.26,<2.4
 scikit-image>=0.22.0
+opencv-python-headless>=4.8.0
 
 # Deep learning
 torch>=2.7.0

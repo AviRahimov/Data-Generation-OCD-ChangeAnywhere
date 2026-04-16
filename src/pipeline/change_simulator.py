@@ -156,16 +156,101 @@ def simulate_disappearance(seg_map, rng=None, max_object_ratio=0.15, min_object_
     }
 
 
-def simulate_change(seg_map, rng=None, appearance_prob=0.6):
+def simulate_disappearance_targeted(detected_objects, seg_map, rng=None,
+                                     max_objects=2):
+    """Remove 1-2 SAM3-detected objects by replacing them with background.
+
+    Args:
+        detected_objects: list of dicts from SAMModel.detect_objects(),
+            each with keys: mask, label, score, area_ratio
+        seg_map: SegFormer semantic map (H, W) for background context
+        rng: random.Random instance
+        max_objects: max number of objects to remove at once
+
+    Returns (change_mask, prompt, meta) or None if no suitable objects.
+    """
+    from scipy import ndimage
+    rng = rng or random.Random()
+
+    if not detected_objects:
+        return None
+
+    n_pick = min(max_objects, len(detected_objects))
+    weights = [d["score"] for d in detected_objects]
+    total_w = sum(weights)
+    if total_w == 0:
+        return None
+    weights = [w / total_w for w in weights]
+
+    picked = []
+    remaining = list(range(len(detected_objects)))
+    rem_weights = list(weights)
+    for _ in range(n_pick):
+        if not remaining:
+            break
+        chosen = rng.choices(remaining, weights=rem_weights, k=1)[0]
+        picked.append(chosen)
+        idx = remaining.index(chosen)
+        remaining.pop(idx)
+        rem_weights.pop(idx)
+
+    h, w = seg_map.shape
+    combined_mask = np.zeros((h, w), dtype=bool)
+    labels_removed = []
+    scores = []
+
+    for idx in picked:
+        obj = detected_objects[idx]
+        obj_mask = obj["mask"]
+        if obj_mask.shape != (h, w):
+            continue
+        combined_mask |= obj_mask
+        labels_removed.append(obj["label"])
+        scores.append(obj["score"])
+
+    if combined_mask.sum() == 0:
+        return None
+
+    combined_mask = ndimage.binary_dilation(combined_mask, iterations=4)
+
+    bg_regions = _find_background_region(seg_map)
+    surround_class = bg_regions[0][0] if bg_regions else 13
+    prompt = get_disappearance_prompt(surround_class, rng)
+
+    return combined_mask, prompt, {
+        "event": "disappearance_targeted",
+        "removed_labels": labels_removed,
+        "removed_scores": [round(s, 3) for s in scores],
+        "bg_class": surround_class,
+        "bg_label": get_background_label(surround_class),
+        "change_pixels": int(combined_mask.sum()),
+    }
+
+
+def simulate_change(seg_map, rng=None, appearance_prob=0.20,
+                    detected_objects=None):
     """Simulate a random change event (appearance or disappearance).
 
-    Returns (change_mask, prompt, meta) or None if the tile has no
-    suitable regions.
+    When detected_objects (from SAM3) are provided and a disappearance
+    event is selected, uses targeted removal for precise object masks.
+
+    Args:
+        seg_map: SegFormer semantic map (H, W)
+        rng: random.Random
+        appearance_prob: probability of appearance (rest is disappearance)
+        detected_objects: optional list from SAMModel.detect_objects()
+
+    Returns (change_mask, prompt, meta) or None.
     """
     rng = rng or random.Random()
 
     if rng.random() < appearance_prob:
         result = simulate_appearance(seg_map, rng)
+        if result is not None:
+            return result
+
+    if detected_objects:
+        result = simulate_disappearance_targeted(detected_objects, seg_map, rng)
         if result is not None:
             return result
 

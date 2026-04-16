@@ -18,6 +18,7 @@ class Config:
         self.segmentation = raw.get('segmentation', {})
         self.inpainting = raw.get('inpainting', {})
         self.synthetic = raw.get('synthetic', {})
+        self.assembler = raw.get('assembler', {})
         self.logging = raw.get('logging', {})
 
     def __repr__(self):

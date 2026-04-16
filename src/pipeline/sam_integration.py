@@ -13,13 +13,18 @@ except ImportError:
 class SAMModel:
     """SAM 3 segmentation using the HuggingFace Transformers local checkpoint.
 
-    Runs text-prompted instance segmentation with multiple class prompts,
-    then merges all detected masks into a single integer segmentation map.
+    Supports two modes:
+      - segment(): merges all detected masks into a single integer segmentation map
+      - detect_objects(): returns individual instance masks with labels and scores
     """
 
     DEFAULT_PROMPTS = [
         "tree", "bush", "vegetation", "road", "car", "building",
         "house", "ground", "fence", "pole", "sidewalk", "dirt",
+    ]
+
+    DEFAULT_DETECTION_PROMPTS = [
+        "rock", "person", "car", "box", "bag", "bush",
     ]
 
     def __init__(self, checkpoint="SAM3", device="cuda",
@@ -94,3 +99,59 @@ class SAMModel:
             seg[all_masks[idx]] = rank + 1
 
         return seg
+
+    @torch.inference_mode()
+    def detect_objects(self, pil_image, prompts=None, min_score=0.30,
+                       min_area_ratio=0.005, max_area_ratio=0.30):
+        """Detect individual objects using targeted text prompts.
+
+        Unlike segment(), this returns each detection separately so callers
+        can pick specific objects for removal or other operations.
+
+        Args:
+            pil_image: PIL RGB image
+            prompts: list of text prompts (defaults to DEFAULT_DETECTION_PROMPTS)
+            min_score: minimum confidence score to keep a detection
+            min_area_ratio: discard detections smaller than this fraction of the tile
+            max_area_ratio: discard detections larger than this fraction of the tile
+
+        Returns:
+            list of dicts, each with keys:
+                mask: bool ndarray (H, W)
+                label: str (the prompt that found it)
+                score: float (confidence)
+                area_ratio: float (fraction of image covered)
+        """
+        prompts = prompts or self.DEFAULT_DETECTION_PROMPTS
+        h, w = pil_image.size[1], pil_image.size[0]
+        total_pixels = h * w
+        detections = []
+
+        for prompt in prompts:
+            try:
+                masks, scores, _ = self._run_prompt(pil_image, prompt)
+            except Exception as e:
+                print(f"  SAM3 detect_objects error for '{prompt}': {e}",
+                      file=sys.stderr)
+                continue
+
+            for m, s in zip(masks, scores):
+                score_val = float(s.cpu()) if hasattr(s, "cpu") else float(s)
+                if score_val < min_score:
+                    continue
+
+                m_np = m.cpu().numpy().astype(bool) if hasattr(m, "cpu") else np.asarray(m, dtype=bool)
+                area_ratio = m_np.sum() / total_pixels
+
+                if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                    continue
+
+                detections.append({
+                    "mask": m_np,
+                    "label": prompt,
+                    "score": score_val,
+                    "area_ratio": area_ratio,
+                })
+
+        detections.sort(key=lambda d: d["score"], reverse=True)
+        return detections

@@ -1,5 +1,6 @@
-"""End-to-end test: tile one pair, segment with SegFormer, simulate changes,
-inpaint with SD2, and produce comparison grids for visual inspection."""
+"""End-to-end test: tile one pair, detect objects with SAM3, segment with
+SegFormer, simulate changes (80% disappearance), inpaint with SD2 using
+feathered masks, and produce comparison grids for visual inspection."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -58,6 +59,33 @@ def _contour_overlay(base, mask_bool, color=(255, 40, 40), thickness=2, fill_alp
     arr[contour] = color
 
     return Image.fromarray(arr)
+
+
+def _visualize_detections(base, detections):
+    """Draw SAM3 detections as colored overlays with labels."""
+    arr = np.array(base.copy())
+    colors = [
+        (0, 255, 0), (255, 255, 0), (0, 200, 255),
+        (255, 0, 255), (255, 128, 0), (0, 255, 128),
+    ]
+    for i, det in enumerate(detections):
+        color = colors[i % len(colors)]
+        mask = det["mask"]
+        overlay_color = np.array(color, dtype=np.float32)
+        arr[mask] = (arr[mask] * 0.6 + overlay_color * 0.4).astype(np.uint8)
+
+    vis = Image.fromarray(arr)
+    draw = ImageDraw.Draw(vis)
+    fnt = _font(14)
+    for i, det in enumerate(detections):
+        ys, xs = np.where(det["mask"])
+        if len(ys) == 0:
+            continue
+        cy, cx = int(ys.mean()), int(xs.mean())
+        label = f"{det['label']} ({det['score']:.2f})"
+        draw.text((cx, cy), label, fill=(255, 255, 255), font=fnt)
+
+    return vis
 
 
 def build_grid(panels, titles, path):
@@ -165,13 +193,22 @@ def main():
         cfg.segmentation.get("active_model", "segformer"), cfg.segmentation
     )
 
+    print("  Loading SAM3 (object detection)...")
+    sam_cfg = cfg.segmentation.get("sam", {})
+    sam_model = get_segmentation_model("sam", cfg.segmentation)
+    detection_prompts = sam_cfg.get("detection_prompts",
+                                    ["rock", "person", "car", "box", "bag", "bush"])
+    detection_score = sam_cfg.get("detection_score_threshold", 0.30)
+
     print("  Loading SD2-Inpainting...")
     inpaint = InpaintingModel(
         model_id=cfg.inpainting.get("model_id"),
         device=cfg.inpainting.get("device", "cuda"),
         num_inference_steps=cfg.inpainting.get("num_inference_steps", 50),
-        guidance_scale=cfg.inpainting.get("guidance_scale", 9.0),
+        guidance_scale=cfg.inpainting.get("guidance_scale", 12.0),
         strength=cfg.inpainting.get("strength", 1.0),
+        mask_blur_radius=cfg.inpainting.get("mask_blur_radius", 12),
+        mask_dilate_px=cfg.inpainting.get("mask_dilate_px", 8),
     )
 
     # --- Pre-filter tiles to those with >= 2 semantic classes ---
@@ -197,9 +234,23 @@ def main():
         before = Image.open(tile_path).convert("RGB")
         seg_vis = _colorize_seg(seg)
 
+        # --- SAM3 object detection ---
+        print("    Running SAM3 detection...")
+        detections = sam_model.detect_objects(
+            before, prompts=detection_prompts, min_score=detection_score,
+        )
+        det_summary = [f"{d['label']}({d['score']:.2f})" for d in detections]
+        print(f"    SAM3 found {len(detections)} objects: {det_summary}")
+
+        det_vis = _visualize_detections(before, detections)
+
+        # --- Simulate change (80% disappearance / 20% appearance) ---
         tile_rng = random.Random(42 + i)
-        app_prob = cfg.synthetic.get("appearance_prob", 0.85)
-        result = simulate_change(seg, rng=tile_rng, appearance_prob=app_prob)
+        app_prob = cfg.synthetic.get("appearance_prob", 0.20)
+        result = simulate_change(
+            seg, rng=tile_rng, appearance_prob=app_prob,
+            detected_objects=detections,
+        )
         if result is None:
             print("    No change possible on this tile, skipping")
             continue
@@ -209,7 +260,8 @@ def main():
 
         change_mask_pil = Image.fromarray((change_mask.astype(np.uint8) * 255))
 
-        print("    Inpainting...")
+        # --- Inpaint with feathered blending ---
+        print("    Inpainting (feathered)...")
         synth_after = inpaint.inpaint(
             before, change_mask, prompt, seed=42 + i,
         )
@@ -220,6 +272,7 @@ def main():
         panels = [
             before,
             seg_vis,
+            det_vis,
             overlay,
             synth_after,
             change_mask_pil.convert("RGB"),
@@ -228,10 +281,11 @@ def main():
         titles = [
             "1. Original Tile",
             "2. Semantic Map (SegFormer)",
-            "3. Change Region",
-            "4. Synthetic After (SD2)",
-            "5. Change Mask",
-            "6. After + Change Overlay",
+            f"3. SAM3 Detections ({len(detections)})",
+            "4. Change Region",
+            "5. Synthetic After (SD2)",
+            "6. Change Mask",
+            "7. After + Change Overlay",
         ]
         grid_path = out_dir / f"{name}_grid.png"
         build_grid(panels, titles, grid_path)

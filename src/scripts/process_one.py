@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pipeline.config import Config
 from pipeline.tiler import save_tiles_for_image
 from pipeline.segmentation import get_segmentation_model
-from pipeline.inpainting import InpaintingModel
+from pipeline.inpainting import build_inpainter_from_cfg
 from pipeline.change_simulator import simulate_change
 from pipeline.prompt_templates import get_background_label, TERRAIN_BACKGROUND_CLASSES
 
@@ -200,16 +200,9 @@ def main():
                                     ["rock", "person", "car", "box", "bag", "bush"])
     detection_score = sam_cfg.get("detection_score_threshold", 0.30)
 
-    print("  Loading SD2-Inpainting...")
-    inpaint = InpaintingModel(
-        model_id=cfg.inpainting.get("model_id"),
-        device=cfg.inpainting.get("device", "cuda"),
-        num_inference_steps=cfg.inpainting.get("num_inference_steps", 50),
-        guidance_scale=cfg.inpainting.get("guidance_scale", 12.0),
-        strength=cfg.inpainting.get("strength", 1.0),
-        mask_blur_radius=cfg.inpainting.get("mask_blur_radius", 12),
-        mask_dilate_px=cfg.inpainting.get("mask_dilate_px", 8),
-    )
+    backend = cfg.inpainting.get("backend", "sd2")
+    print(f"  Loading inpainting backend: {backend}...")
+    inpaint = build_inpainter_from_cfg(cfg.inpainting)
 
     # --- Pre-filter tiles to those with >= 2 semantic classes ---
     print("  Pre-filtering tiles (segmenting all to find interesting ones)...")

@@ -58,7 +58,9 @@ class SegformerModel(SegmentationModel):
 
         self.device = device
         self.image_processor = SegformerImageProcessor.from_pretrained(checkpoint)
-        self.model = SegformerForSemanticSegmentation.from_pretrained(checkpoint).to(self.device)
+        self.model = SegformerForSemanticSegmentation.from_pretrained(
+            checkpoint, use_safetensors=True
+        ).to(self.device)
         self.model.eval()
 
     def segment(self, pil_image):

@@ -46,7 +46,7 @@ class SAMModel:
         self.prompts = prompts or self.DEFAULT_PROMPTS
 
         self.model = Sam3Model.from_pretrained(
-            checkpoint, torch_dtype=torch.float16
+            checkpoint, torch_dtype=torch.float16, use_safetensors=True
         ).to(device).eval()
         self.processor = HFSam3Processor.from_pretrained(checkpoint)
 

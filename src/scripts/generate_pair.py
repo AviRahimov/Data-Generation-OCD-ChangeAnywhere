@@ -23,7 +23,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from pipeline.config import Config
 from pipeline.segmentation import get_segmentation_model
-from pipeline.inpainting import InpaintingModel
+from pipeline.inpainting import build_inpainter_from_cfg
 from pipeline.synthetic import select_best_objects
 from pipeline.prompt_templates import get_disappearance_prompt, get_background_label
 from pipeline.io import write_json
@@ -251,19 +251,11 @@ def main():
         print("  No objects detected. Exiting.")
         return
 
-    # --- 3. Load SD2-Inpainting ---
+    # --- 3. Load inpainting backend ---
+    backend = cfg.inpainting.get("backend", "sd2")
     blend_mode = cfg.inpainting.get("blend_mode", "poisson")
-    print(f"  Loading SD2-Inpainting (blend_mode={blend_mode})...")
-    inpaint = InpaintingModel(
-        model_id=cfg.inpainting.get("model_id"),
-        device=cfg.inpainting.get("device", "cuda"),
-        num_inference_steps=cfg.inpainting.get("num_inference_steps", 50),
-        guidance_scale=cfg.inpainting.get("guidance_scale", 12.0),
-        strength=cfg.inpainting.get("strength", 1.0),
-        mask_blur_radius=cfg.inpainting.get("mask_blur_radius", 12),
-        mask_dilate_px=cfg.inpainting.get("mask_dilate_px", 8),
-        blend_mode=blend_mode,
-    )
+    print(f"  Loading inpainting backend: {backend} (blend_mode={blend_mode})...")
+    inpaint = build_inpainter_from_cfg(cfg.inpainting)
 
     # --- 4. Load SegFormer for background context ---
     print("  Loading SegFormer (background context)...")

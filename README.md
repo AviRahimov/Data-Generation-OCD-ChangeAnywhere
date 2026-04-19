@@ -280,6 +280,20 @@ Data-Generation-OCD-ChangeAnywhere/
   - `meta.json` - one entry per removed object with label, score,
     bbox, prompt.
 
+- **[`src/scripts/generate_dataset.py`](src/scripts/generate_dataset.py)** -
+  batch driver for producing an arbitrary number of full-resolution
+  synthetic pairs. Takes a source folder of images (auto-detects either
+  `pair_*/before.jpg` layout or a flat folder of `.jpg`/`.png`),
+  randomly samples one input per iteration using a **balanced sampler**
+  (each input gets `floor(N/K)` or `ceil(N/K)` draws, max imbalance 1),
+  picks `k ~ Uniform[min_objects, max_objects]` object changes per pair,
+  and for each of the `k` slots flips `synthetic.appearance_prob` to
+  choose between adding a new object and removing an existing one.
+  Loads SAM 3 / SegFormer / inpainter once and reuses them for every
+  iteration, and writes a `manifest.csv` plus one `gen_{i:05d}/` folder
+  per sample. See [Batch dataset generation](#batch-dataset-generation)
+  below.
+
 - **[`src/scripts/compare_inpaint_backends.py`](src/scripts/compare_inpaint_backends.py)** -
   A/B-tests the three inpainting backends on identical input. Loads
   SegFormer + SAM 3 once, simulates one change per sampled tile, then
@@ -377,6 +391,80 @@ python .\src\scripts\generate_pair.py pair_0011
 
 Outputs: `src/data/workspace/synthetic/<pair>/full/{synthetic_after.jpg,
 change_mask.png, overview.png, meta.json}`.
+
+### Batch dataset generation
+
+Generate `N` synthetic pairs in one shot from a folder of source images:
+
+```powershell
+python .\src\scripts\generate_dataset.py `
+    --input-dir src\data\original_OCD_dataset `
+    --n-images 1000 `
+    --output-dir src\data\workspace\dataset_v1 `
+    --min-objects 1 --max-objects 20 `
+    --seed 42
+```
+
+The script:
+
+- **Auto-detects the input layout.** If `--input-dir` contains
+  `pair_*/before.jpg` subfolders, those are used; otherwise it
+  recursively globs `.jpg` / `.jpeg` / `.png` files.
+- **Samples inputs in a balanced way.** Given `K` source images and
+  `N` requested outputs, every image gets either `floor(N/K)` or
+  `ceil(N/K)` draws (max imbalance of 1). Order is still shuffled
+  deterministically from `--seed`.
+- **Randomizes object count per pair.** Each generated image has a
+  random number `k` of object changes drawn from
+  `Uniform[min_objects, max_objects]` (inclusive).
+- **Randomizes add vs remove per object.** For each of the `k` slots,
+  flips `synthetic.appearance_prob` (default 0.20 — 20% add, 80%
+  remove). Override via `--appearance-prob 0.5` if needed. If SAM 3
+  doesn't actually find enough removable objects in an image, we do
+  as many as we found and record the shortfall in `meta.json`.
+- **Loads models once, reuses for all N.** SAM 3 + SegFormer +
+  inpainter load at startup (~30 s) and then each iteration is
+  inpainting-bound, not loading-bound.
+
+Output layout:
+
+```
+dataset_v1/
+  manifest.csv                   # one row per sample (see below)
+  gen_00000/
+    before.jpg                   # copy of the sampled source
+    synthetic_after.jpg          # full-resolution after
+    change_mask.png              # full-resolution binary mask
+    comparison.png               # 2x2 grid (Before / After / Mask / Overlay)
+                                 #   with large titles for quick QA
+    meta.json                    # per-change details + backend + seed
+    overview.png                 # only if --save-overview (close-up crops)
+  gen_00001/
+    ...
+```
+
+`comparison.png` is emitted by default and is the easiest file to open
+when reviewing results -- it shows the original, the synthetic output,
+the binary change mask, and a red-contour overlay on the before image
+so the edited region pops out even when the synthetic change is
+visually subtle. Pass `--no-comparison` to suppress it, or
+`--comparison-width 2048` to make the panels larger.
+
+`manifest.csv` columns:
+`id, source_path, n_requested, n_applied, n_add_requested,
+n_add_applied, n_remove_requested, n_remove_applied, labels, status,
+elapsed_s`. `status` is `ok`, `empty` (no changes actually produced -
+rare, only when SAM found nothing AND all appearance attempts were
+rejected), or `error: ...`.
+
+Useful extras:
+
+- `--save-overview` - also emits `overview.png` per sample for visual
+  QA (roughly doubles disk usage).
+- `--backend sdxl` - override the inpainting backend for this run
+  without editing the config.
+- `--appearance-prob 0.5` - override the add/remove ratio.
+- `--config some/other/config.yaml` - use a different config file.
 
 ### Compare the three inpainters on the same tile
 

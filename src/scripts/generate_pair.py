@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import random
 import shutil
 import numpy as np
 import yaml
@@ -24,8 +23,10 @@ from PIL import Image, ImageDraw, ImageFont
 from pipeline.config import Config
 from pipeline.segmentation import get_segmentation_model
 from pipeline.inpainting import build_inpainter_from_cfg
-from pipeline.synthetic import select_best_objects
-from pipeline.prompt_templates import get_disappearance_prompt, get_background_label
+from pipeline.synthetic import (
+    select_best_objects,
+    generate_full_image_pair,
+)
 from pipeline.io import write_json
 
 TITLE_H = 48
@@ -80,36 +81,6 @@ def _contour_overlay(base, mask_bool, color=(0, 255, 0), thickness=3, fill_alpha
     contour = mask_bool & ~eroded
     arr[contour] = color
     return Image.fromarray(arr)
-
-
-def _paste_inpainted(canvas, inpaint_result):
-    """Paste an inpainted crop back onto the full-image canvas.
-
-    With Poisson blending the crop edges already contain unchanged original
-    pixels (object mask never reaches the padded crop boundary), so a direct
-    paste is seamless. A minimal 8px safety feather is applied to avoid any
-    sub-pixel rounding artifacts at the very edge of the crop.
-    """
-    crop_pil = inpaint_result["inpainted_crop"]
-    x1, y1, x2, y2 = inpaint_result["paste_box"]
-    crop_w, crop_h = x2 - x1, y2 - y1
-
-    crop = np.array(crop_pil).astype(np.float32)
-    region = np.array(canvas.crop((x1, y1, x2, y2))).astype(np.float32)
-
-    margin = 8
-    m = min(margin, crop_h // 2, crop_w // 2)
-    alpha = np.ones((crop_h, crop_w), dtype=np.float32)
-    for i in range(m):
-        v = (i + 1) / (m + 1)
-        alpha[i, :] = np.minimum(alpha[i, :], v)
-        alpha[-(i + 1), :] = np.minimum(alpha[-(i + 1), :], v)
-        alpha[:, i] = np.minimum(alpha[:, i], v)
-        alpha[:, -(i + 1)] = np.minimum(alpha[:, -(i + 1)], v)
-
-    alpha_3 = alpha[..., np.newaxis]
-    blended = region * (1.0 - alpha_3) + crop * alpha_3
-    canvas.paste(Image.fromarray(blended.astype(np.uint8)), (x1, y1))
 
 
 def build_overview(before_full, after_full, change_mask_full,
@@ -263,85 +234,21 @@ def main():
         cfg.segmentation.get("active_model", "segformer"), cfg.segmentation
     )
 
-    # --- 5. Object-centric inpainting ---
-    canvas = before_full.copy()
-    change_mask_full = np.zeros(
-        (full_size[1], full_size[0]), dtype=bool
-    )
-    object_crops = []
-    meta_entries = []
+    # --- 5. Object-centric inpainting (shared with generate_dataset.py) ---
     seed = cfg.synthetic.get("seed", 42)
-
-    for i, obj in enumerate(best_objects):
-        label = obj["label"]
-        cx, cy = obj["centroid_fullimg"]
-        bbox = obj["bbox_fullimg"]
-        bx1, by1, bx2, by2 = bbox
-        bw, bh = bx2 - bx1, by2 - by1
-
-        print(f"\n  [{i+1}/{len(best_objects)}] Inpainting {label} "
-              f"at ({cx},{cy}), size {bw}x{bh}...")
-
-        seg_crop_x1 = max(bx1 - 64, 0)
-        seg_crop_y1 = max(by1 - 64, 0)
-        seg_crop_x2 = min(bx2 + 64, full_size[0])
-        seg_crop_y2 = min(by2 + 64, full_size[1])
-        seg_tile = before_full.crop((seg_crop_x1, seg_crop_y1,
-                                     seg_crop_x2, seg_crop_y2))
-        seg_map = seg_model.segment(seg_tile)
-
-        from pipeline.change_simulator import _find_background_region
-        bg_regions = _find_background_region(seg_map)
-        surround_class = bg_regions[0][0] if bg_regions else 13
-        rng = random.Random(seed + i)
-        prompt = get_disappearance_prompt(surround_class, rng)
-
-        print(f"    Background: {get_background_label(surround_class)}")
-        print(f"    Prompt: {prompt[:80]}...")
-
-        before_crop_box = (
-            max(bx1 - int(bw * 0.3), 0),
-            max(by1 - int(bh * 0.3), 0),
-            min(bx2 + int(bw * 0.3), full_size[0]),
-            min(by2 + int(bh * 0.3), full_size[1]),
-        )
-        before_crop = before_full.crop(before_crop_box)
-
-        result = inpaint.inpaint_object(
-            full_image=before_full,
-            obj_mask_fullimg=obj["mask_fullimg"],
-            prompt=prompt,
-            bbox_fullimg=bbox,
-            pad_ratio=0.3,
-            feather_margin=48,
-            seed=seed + i,
-        )
-
-        _paste_inpainted(canvas, result)
-
-        px1, py1, px2, py2 = result["paste_box"]
-        local_mask = result["mask_crop"]
-        change_mask_full[py1:py2, px1:px2] |= local_mask
-
-        after_crop = canvas.crop(before_crop_box)
-        object_crops.append({
-            "before_crop": before_crop,
-            "after_crop": after_crop,
-            "label": label,
-            "score": obj["score"],
-        })
-        meta_entries.append({
-            "label": label,
-            "score": round(obj["score"], 3),
-            "visibility": round(obj["visibility"], 3),
-            "centroid": [cx, cy],
-            "bbox": list(bbox),
-            "paste_box": list(result["paste_box"]),
-            "prompt": prompt,
-            "bg_class": surround_class,
-        })
-
-        print(f"    Done. Paste region: {px2-px1}x{py2-py1}")
+    result = generate_full_image_pair(
+        before_full=before_full,
+        changes=best_objects,
+        inpaint_model=inpaint,
+        seg_model=seg_model,
+        seed=seed,
+        verbose=True,
+        collect_crops=True,
+    )
+    canvas = result["after"]
+    mask_pil = result["change_mask"]
+    meta_entries = result["meta_entries"]
+    object_crops = result["object_crops"] or []
 
     inpaint.cleanup()
 
@@ -360,7 +267,6 @@ def main():
     canvas.save(after_out, quality=95)
     print(f"\n  Saved: {after_out}")
 
-    mask_pil = Image.fromarray(change_mask_full.astype(np.uint8) * 255)
     mask_out = out_dir / "change_mask.png"
     mask_pil.save(mask_out)
     print(f"  Saved: {mask_out}")

@@ -55,6 +55,7 @@ from pipeline.synthetic import (
     select_best_objects,
     select_appearance_locations,
     generate_full_image_pair,
+    compute_local_ssim_change_mask,
 )
 from pipeline.io import write_json
 
@@ -84,6 +85,10 @@ def parse_args():
     p.add_argument("--backend", choices=["sd2", "sd15_realistic", "sdxl"],
                    default=None,
                    help="Override the inpainting.backend from config.")
+    p.add_argument("--detection-mode", choices=["text", "auto"], default=None,
+                   help="Override segmentation.sam.detection_mode from "
+                        "config.yaml. 'text' uses the prompt list; 'auto' "
+                        "runs SAM 3 prompt-free and keeps 'meaningful' masks.")
     p.add_argument("--seed", type=int, default=42,
                    help="Master RNG seed; makes sampling reproducible.")
     p.add_argument("--save-overview", action="store_true",
@@ -322,6 +327,14 @@ def main():
     scan_tile_size = sam_cfg.get("scan_tile_size", 1024)
     scan_overlap = sam_cfg.get("scan_overlap", 128)
 
+    detection_mode = args.detection_mode or sam_cfg.get("detection_mode", "text")
+    if detection_mode not in ("text", "auto"):
+        raise ValueError(
+            f"Invalid detection_mode '{detection_mode}'; expected 'text' or 'auto'.")
+    auto_cfg = sam_cfg.get("auto", {}) or {}
+    print(f"  detection_mode : {detection_mode}"
+          f"{' (prompt-free)' if detection_mode == 'auto' else ''}")
+
     print("  Loading SegFormer...")
     seg_model = get_segmentation_model(
         cfg.segmentation.get("active_model", "segformer"), cfg.segmentation)
@@ -381,6 +394,9 @@ def main():
                         min_object_distance=min_obj_dist,
                         max_detections_per_crop=max_dets_crop,
                         max_per_label=max_per_label,
+                        detection_mode=detection_mode,
+                        seg_model=seg_model,
+                        auto_cfg=auto_cfg,
                     )
                     for r in removals:
                         r["kind"] = "disappearance"
@@ -422,6 +438,36 @@ def main():
                     )
 
                 meta_entries = result["meta_entries"]
+
+                qc_cfg = syn_cfg.get("full_image_quality") or {}
+                if qc_cfg.get("enabled") and status == "ok" and len(meta_entries) > 0:
+                    cm = np.array(result["change_mask"], dtype=np.uint8)
+                    if np.any(cm > 0):
+                        score_loc = compute_local_ssim_change_mask(
+                            before_full, result["after"], cm,
+                            pad=int(qc_cfg.get("crop_pad_px", 64)),
+                        )
+                        lo = float(qc_cfg.get("local_ssim_min", 0.15))
+                        hi = float(qc_cfg.get("local_ssim_max", 0.995))
+                        if score_loc >= 0 and (score_loc < lo or score_loc > hi):
+                            status = "quality_reject"
+
+                if status == "quality_reject":
+                    elapsed = time.time() - start
+                    n_add_applied = sum(
+                        1 for m in meta_entries if m.get("kind") == "appearance")
+                    n_rem_applied = sum(
+                        1 for m in meta_entries if m.get("kind") == "disappearance")
+                    labels = ";".join(
+                        m["label"] for m in meta_entries) if meta_entries else ""
+                    manifest_writer.writerow([
+                        gen_id, str(src_path), n_total, len(meta_entries),
+                        n_add_req, n_add_applied,
+                        n_rem_req, n_rem_applied,
+                        labels, status, f"{elapsed:.1f}",
+                    ])
+                    manifest_f.flush()
+                    continue
 
                 out_dir = args.output_dir / gen_id
                 out_dir.mkdir(parents=True, exist_ok=True)

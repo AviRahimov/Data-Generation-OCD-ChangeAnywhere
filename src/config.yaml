@@ -26,8 +26,28 @@ segmentation:
     mask_threshold: 0.5
     scan_tile_size: 1024
     scan_overlap: 128
+    # "text" = user lists object categories in detection_prompts (default, current behaviour).
+    # "auto" = prompt-free segment-everything mode; labels are dropped because
+    #          SAM 3 has no text to attach. Use when target objects are unknown
+    #          at runtime (real-time scenarios).
+    detection_mode: "text"
     detection_prompts: ["rock", "person", "car", "box", "bag", "bush"]
     detection_score_threshold: 0.30
+    auto:
+      # 16x16 = 256 foreground seed points on each 1024-px scan crop.
+      # Higher => slower but finds smaller objects; lower => faster but misses detail.
+      points_per_side: 16
+      # Drop masks whose dominant SegFormer class is ground/grass/sand/etc.
+      # Otherwise "segment everything" returns big terrain blobs that aren't
+      # useful objects. Advanced users can set to false for debugging.
+      ignore_terrain: true
+      # Drop masks smaller/larger than these fractions of the scan crop.
+      min_area_ratio: 0.0005
+      max_area_ratio: 0.15
+      # Advanced tuning: shape regularity (1.0 = circle, 0 = stringy) and
+      # how distinct the mask is from its immediate surroundings.
+      min_compactness: 0.25
+      min_contrast: 8.0
 
 inpainting:
   backend: "sd2"             # "sd2" | "sd15_realistic" | "sdxl"
@@ -64,9 +84,15 @@ synthetic:
   min_object_distance: 2000  # min px between change centroids (spatial spread)
   max_per_tile: 2            # change variants per tile (batch_generate only)
   appearance_prob: 0.20      # 20% appearance, 80% disappearance
-  ssim_min: 0.4              # discard if after is too different from before
-  ssim_max: 0.99             # discard if nothing changed
+  ssim_min: 0.4              # tile batch_generate / generate_synthetic_pair only (local SSIM)
+  ssim_max: 0.99             # tile paths only; full-image scripts ignore unless full_image_quality enabled
   seed: 42
+  # Optional quality gate for generate_dataset.py / generate_full_image_pair output.
+  full_image_quality:
+    enabled: false           # if true, drop samples whose local SSIM vs change bbox is out of range
+    crop_pad_px: 64          # padding around tight bbox of final change_mask for local SSIM
+    local_ssim_min: 0.15    # too low = catastrophic change or misalignment
+    local_ssim_max: 0.995   # too high = likely no visible edit
 
 assembler:
   max_changed_tiles: 3

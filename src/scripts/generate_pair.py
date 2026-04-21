@@ -157,11 +157,28 @@ def build_overview(before_full, after_full, change_mask_full,
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Generate a full-resolution synthetic change pair.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("pair", nargs="?", default=None,
+                        help="Pair folder name under data.raw_root "
+                             "(defaults to testing.test_pair in config).")
+    parser.add_argument("--detection-mode", choices=["text", "auto"], default=None,
+                        help="Override segmentation.sam.detection_mode from "
+                             "config.yaml.")
+    parser.add_argument("--max-objects", type=int, default=None,
+                        help="Override synthetic.max_changes (cap on how many "
+                             "objects are inpainted per pair). Use --max-objects 1 "
+                             "for fast smoke tests.")
+    args = parser.parse_args()
+
     cfg = Config("src/config.yaml")
     yml = yaml.safe_load(cfg.path.open().read())
 
-    pair_name = (sys.argv[1] if len(sys.argv) > 1
-                 else yml.get("testing", {}).get("test_pair", "pair_0000"))
+    pair_name = args.pair or yml.get("testing", {}).get("test_pair", "pair_0000")
 
     raw = Path(cfg.data["raw_root"])
     pair_dir = raw / pair_name
@@ -184,14 +201,31 @@ def main():
     scan_tile_size = sam_cfg.get("scan_tile_size", 1024)
     scan_overlap = sam_cfg.get("scan_overlap", 128)
 
+    detection_mode = args.detection_mode or sam_cfg.get("detection_mode", "text")
+    if detection_mode not in ("text", "auto"):
+        raise ValueError(
+            f"Invalid detection_mode '{detection_mode}'; expected 'text' or 'auto'.")
+    auto_cfg = sam_cfg.get("auto", {}) or {}
+    print(f"  detection_mode: {detection_mode}"
+          f"{' (prompt-free)' if detection_mode == 'auto' else ''}")
+
     # --- 2. Scan full image with 1024 crops, select best objects ---
     syn_cfg = cfg.synthetic
     asm_cfg = cfg.assembler
-    max_objects = syn_cfg.get("max_changes", asm_cfg.get("max_changed_tiles", 3))
+    max_objects = (args.max_objects
+                   if args.max_objects is not None
+                   else syn_cfg.get("max_changes", asm_cfg.get("max_changed_tiles", 3)))
     min_obj_dist = syn_cfg.get("min_object_distance", asm_cfg.get("min_tile_distance", 2000))
     max_per_label = syn_cfg.get("max_per_label", 0)
     variance_thresh = asm_cfg.get("variance_prefilter", 500)
     max_dets_crop = asm_cfg.get("max_detections_per_tile", 3)
+
+    # Load SegFormer early: auto mode needs it for the terrain post-filter,
+    # and it's reused later for background-context prompts too.
+    print("  Loading SegFormer (background context)...")
+    seg_model = get_segmentation_model(
+        cfg.segmentation.get("active_model", "segformer"), cfg.segmentation
+    )
 
     print(f"  Scanning full image with {scan_tile_size}x{scan_tile_size} "
           f"crops (overlap={scan_overlap})...")
@@ -208,6 +242,9 @@ def main():
         min_object_distance=min_obj_dist,
         max_detections_per_crop=max_dets_crop,
         max_per_label=max_per_label,
+        detection_mode=detection_mode,
+        seg_model=seg_model,
+        auto_cfg=auto_cfg,
     )
 
     print(f"  Selected {len(best_objects)} objects for removal:")
@@ -227,12 +264,6 @@ def main():
     blend_mode = cfg.inpainting.get("blend_mode", "poisson")
     print(f"  Loading inpainting backend: {backend} (blend_mode={blend_mode})...")
     inpaint = build_inpainter_from_cfg(cfg.inpainting)
-
-    # --- 4. Load SegFormer for background context ---
-    print("  Loading SegFormer (background context)...")
-    seg_model = get_segmentation_model(
-        cfg.segmentation.get("active_model", "segformer"), cfg.segmentation
-    )
 
     # --- 5. Object-centric inpainting (shared with generate_dataset.py) ---
     seed = cfg.synthetic.get("seed", 42)

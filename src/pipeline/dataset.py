@@ -13,6 +13,7 @@ except ImportError:
 from .config import Config
 from .tiler import save_tiles_for_image
 from .segmentation import get_segmentation_model
+from .inpainting import build_inpainter_from_cfg
 from .io import save_image, read_json, write_json
 from .synthetic import generate_synthetic_after
 
@@ -37,6 +38,7 @@ class Pipeline:
         self.masks_dir.mkdir(parents=True, exist_ok=True)
         self.synthetic_dir.mkdir(parents=True, exist_ok=True)
         self.seg_model = get_segmentation_model(cfg.segmentation.get('active_model', 'fallback'), cfg.segmentation)
+        self.inpaint_model = build_inpainter_from_cfg(cfg.inpainting)
 
     def tile_all(self, use_after_as_base=True):
         pairs = discover_pairs(self.raw_root)
@@ -94,7 +96,15 @@ class Pipeline:
                         continue
                     seg = np.load(seg_npy)
                     before = Image.open(t).convert('RGB')
-                    after_pil, change_pil = generate_synthetic_after(before, seg, max_modified_segments=self.cfg.synthetic.get('max_modified_segments',3), color_jitter=self.cfg.synthetic.get('color_jitter',0.2), seed=42)
+                    after_pil, change_pil = generate_synthetic_after(
+                        before, seg, self.inpaint_model,
+                        max_modified_segments=self.cfg.synthetic.get(
+                            'max_modified_segments', 3),
+                        color_jitter=self.cfg.synthetic.get('color_jitter', 0.2),
+                        seed=42,
+                        appearance_prob=self.cfg.synthetic.get(
+                            'appearance_prob', 0.20),
+                    )
 
                     # Calculate SSIM
                     ssim_score = -1.0
@@ -138,12 +148,18 @@ class Pipeline:
 
 
 if __name__ == '__main__':
-    cfg = Config('src/config.yaml')
+    # Run from repo root:  $env:PYTHONPATH="src"; python -m pipeline.dataset
+    _src = Path(__file__).resolve().parents[1]
+    cfg_path = _src / "config.yaml"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(
+            f"Expected config at {cfg_path} (run from repo root with PYTHONPATH=src).")
+    cfg = Config(str(cfg_path))
     p = Pipeline(cfg)
-    print('Tiling...')
+    print("Tiling...")
     p.tile_all()
-    print('Segmenting...')
+    print("Segmenting...")
     p.segment_tiles()
-    print('Generating synthetic...')
+    print("Generating synthetic...")
     p.generate_synthetic()
-    print('Done')
+    print("Done")

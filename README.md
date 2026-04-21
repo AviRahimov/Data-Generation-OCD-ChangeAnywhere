@@ -15,15 +15,16 @@ that look real enough to train change-detection networks on.
 
 1. [Why this exists](#why-this-exists)
 2. [High-level idea](#high-level-idea)
-3. [Project layout](#project-layout)
-4. [File-by-file tour](#file-by-file-tour)
-5. [Models used](#models-used)
-6. [Installation](#installation)
-7. [Quick start](#quick-start)
-8. [Configuration reference](#configuration-reference)
-9. [Design decisions worth knowing](#design-decisions-worth-knowing)
-10. [Outputs on disk](#outputs-on-disk)
-11. [Troubleshooting](#troubleshooting)
+3. [Which pipeline should I run?](docs/PIPELINES.md) (full-image vs tile vs legacy)
+4. [Project layout](#project-layout)
+5. [File-by-file tour](#file-by-file-tour)
+6. [Models used](#models-used)
+7. [Installation](#installation)
+8. [Quick start](#quick-start)
+9. [Configuration reference](#configuration-reference)
+10. [Design decisions worth knowing](#design-decisions-worth-knowing)
+11. [Outputs on disk](#outputs-on-disk)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -77,6 +78,9 @@ Two operating modes coexist:
 
 ```
 Data-Generation-OCD-ChangeAnywhere/
+  docs/
+    PIPELINES.md                  # which script / track to use
+    EXPERIMENT_REAL_VAL.md        # protocol: synthetics vs real val F1
   requirements.txt                  # Python dependencies
   README.md                         # this file
   src/
@@ -104,13 +108,17 @@ Data-Generation-OCD-ChangeAnywhere/
       inpainting.py                 # diffusion wrapper (3 backends, bbox dilation)
       change_simulator.py           # picks WHAT to change and builds the mask
       prompt_templates.py           # ADE20K -> prompts for SD
-      synthetic.py                  # pair generator + whole-image object scanner
+      synthetic.py                  # re-exports (see full_image + tile_synthetic)
+      full_image.py                 # select_best_objects, generate_full_image_pair, ...
+      tile_synthetic.py             # generate_synthetic_pair, batch_generate (per-tile)
       dataset.py                    # batch driver (tile -> segment -> generate)
     scripts/                        # end-user entry points
       process_one.py                # tile-based pipeline (one pair, grid outputs)
       generate_pair.py              # object-centric full-resolution pair
+      generate_dataset.py           # batch full-image dataset + manifest
+      eval_detection_modes.py       # text vs auto SAM eval + CSV / vis
       compare_inpaint_backends.py   # A/B compare SD2 vs SD1.5 vs SDXL
-      run_segment_and_generate.py   # batch driver over all pairs
+      run_segment_and_generate.py   # legacy tile batch driver
 ```
 
 ## File-by-file tour
@@ -237,21 +245,15 @@ Data-Generation-OCD-ChangeAnywhere/
 
 ### Synthetic pair generation
 
-- **[`src/pipeline/synthetic.py`](src/pipeline/synthetic.py)** - higher-level
-  orchestration that combines segmentation, detection, simulation, and
-  inpainting into reusable building blocks:
-  - `generate_synthetic_pair(before_pil, seg_map, inpaint_model, ...)` -
-    one tile, one change, returns `(after, change_mask, meta)` with
-    SSIM score attached.
-  - `batch_generate(tile_paths, seg_model, inpaint_model, ...)` - runs
-    over a list of tiles, writes `before/after_synth/change_mask/meta`
-    per variant plus a `provenance.csv` log, filters by SSIM band.
-  - `select_best_objects(full_image, sam_model, ...)` - the key function
-    for object-centric mode: tiles the full image into 1024x1024 scan
-    crops, runs SAM 3 detection on each, scores detections by visibility
-    (`score * sqrt(area_ratio / 0.01)`), de-duplicates by IoU, and picks
-    up to `max_objects` while enforcing spatial spread and label
-    diversity.
+- **[`src/pipeline/synthetic.py`](src/pipeline/synthetic.py)** - thin re-exports
+  for backward-compatible imports. Implementations live in
+  [`full_image.py`](src/pipeline/full_image.py) and
+  [`tile_synthetic.py`](src/pipeline/tile_synthetic.py):
+  - `generate_synthetic_pair` / `batch_generate` (tile path) — local SSIM on
+    a crop around the change mask; see [`docs/PIPELINES.md`](docs/PIPELINES.md).
+  - `select_best_objects` / `select_appearance_locations` /
+    `generate_full_image_pair` (full-image path) — used by
+    `generate_pair.py` and `generate_dataset.py`.
 
 - **[`src/pipeline/dataset.py`](src/pipeline/dataset.py)** - `Pipeline`
   class wrapping the classic three-stage batch:
@@ -302,6 +304,10 @@ Data-Generation-OCD-ChangeAnywhere/
   `<tile>_compare.png = [Before | Change Region | SD2 | SD1.5 Realistic | SDXL | Mask]`.
   Supports `--tile <stem>` to pin a specific tile and `--n-samples N` to
   change random sampling.
+
+- **[`src/scripts/eval_detection_modes.py`](src/scripts/eval_detection_modes.py)** -
+  compares SAM 3 **text** vs **auto** detection on full `before.jpg` images;
+  writes a CSV and optional side-by-side JPEGs (see [`docs/PIPELINES.md`](docs/PIPELINES.md)).
 
 - **[`src/scripts/run_segment_and_generate.py`](src/scripts/run_segment_and_generate.py)** -
   simplest batch driver: runs `Pipeline.segment_tiles()` + `Pipeline.generate_synthetic()`
@@ -488,6 +494,74 @@ inpainting:
 All three scripts (`process_one`, `generate_pair`,
 `compare_inpaint_backends`) honor this immediately.
 
+### Prompt-free detection (auto mode)
+
+By default SAM 3 is driven by a text-prompt list
+(`segmentation.sam.detection_prompts`) -- you tell it exactly what to
+look for. For real-time scenarios where the set of meaningful objects
+isn't known in advance, the pipeline also supports a **prompt-free
+"segment-everything" mode**:
+
+```yaml
+segmentation:
+  sam:
+    detection_mode: "auto"   # "text" (default) | "auto"
+```
+
+Or override per-run without editing the config:
+
+```powershell
+python .\src\scripts\generate_pair.py    pair_0000 --detection-mode auto
+python .\src\scripts\generate_dataset.py --input-dir ... --n-images 50 --detection-mode auto
+```
+
+What the two modes do:
+
+| Mode | Input to SAM 3 | Output labels | When to use |
+|---|---|---|---|
+| `text` | `detection_prompts` list (e.g. `["rock","car","box",...]`) | real category names | You know ahead of time which objects matter. |
+| `auto` | 16x16 grid of seed points (no text) | all `"object"` | You don't know what will appear. |
+
+In auto mode the pipeline filters SAM's mask flood so you keep only
+"meaningful objects":
+
+- **Geometric filters** drop masks that are too ragged
+  (`min_compactness`) or too visually similar to their surroundings
+  (`min_contrast`).
+- **Terrain filter** (`sam.auto.ignore_terrain`, default `true`)
+  runs SegFormer on each scan crop and drops masks whose dominant
+  ADE20K class is grass / earth / sand / sidewalk / etc. Without this,
+  "segment everything" happily returns giant ground blobs.
+
+All auto-mode knobs live in `segmentation.sam.auto` in
+[`src/config.yaml`](src/config.yaml):
+
+```yaml
+segmentation:
+  sam:
+    detection_mode: "auto"
+    auto:
+      points_per_side: 16    # 256 seed points per 1024 scan crop
+      ignore_terrain: true   # drop terrain/vegetation masks
+      min_area_ratio: 0.0005
+      max_area_ratio: 0.15
+      min_compactness: 0.25
+      min_contrast: 8.0
+```
+
+**Speed trade-off.** Auto mode feeds SAM 3 a single dense box grid per
+crop, while text mode runs one SAM pass per prompt (six by default).
+On a smoke test over `pair_0000` the *detection* stage was actually
+faster in auto mode (~48 s vs ~158 s), but auto mode adds one extra
+SegFormer pass per crop when `ignore_terrain=true`. Either way, SD
+inpainting dominates overall wall-clock.
+
+**Labels caveat.** Auto mode does not produce per-class labels
+(SAM 3 has no text to attach). Every detection comes out as
+`label: "object"` in `meta.json`. Downstream prompts for SD are
+unaffected because they only need the *background* class (from
+SegFormer) plus the event kind; they do not use the SAM label.
+
 ## Configuration reference
 
 See [`src/config.yaml`](src/config.yaml). The most common knobs:
@@ -495,8 +569,10 @@ See [`src/config.yaml`](src/config.yaml). The most common knobs:
 | Section | Key | Effect |
 |---|---|---|
 | `tiling` | `tile_size`, `overlap` | 512 / 64 are a good default for 8K drone frames. Raising `overlap` helps seam-hiding at the cost of more tiles. |
-| `segmentation.sam` | `detection_prompts` | What SAM 3 looks for. Domain-specific: add "person", "pallet", etc. as needed. |
+| `segmentation.sam` | `detection_mode` | `text` uses `detection_prompts`; `auto` runs SAM 3 prompt-free and keeps meaningful masks (see *Prompt-free detection* above). |
+| `segmentation.sam` | `detection_prompts` | What SAM 3 looks for in `text` mode. Domain-specific: add "person", "pallet", etc. as needed. Ignored in `auto` mode. |
 | `segmentation.sam` | `detection_score_threshold` | Minimum SAM 3 confidence. Higher = fewer, more certain objects. |
+| `segmentation.sam.auto` | `points_per_side`, `ignore_terrain`, `min_compactness`, `min_contrast` | Tuning knobs for `auto` mode (grid density, terrain filter, shape regularity, contrast vs. surroundings). |
 | `inpainting` | `backend` | `sd2` / `sd15_realistic` / `sdxl`. Switches the whole pipeline. |
 | `inpainting` | `object_dilate_ratio` | Fraction of object bbox that gets added to the mask before inpainting. 0.08 = 8%. Raise if you still see halos; set to 0 to revert to fixed-size dilation. |
 | `inpainting` | `object_dilate_max_px` | Hard cap on the bbox-aware dilation. Prevents oversmoothing on huge objects. |

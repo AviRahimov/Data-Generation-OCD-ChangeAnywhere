@@ -1,4 +1,4 @@
-# Byte-compiled / optimized / DLL files
+﻿# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -63,6 +63,7 @@ Thumbs.db
 
 # Python notebook checkpoints
 .ipynb_checkpoints/
+
 
 # Misc
 *.bak

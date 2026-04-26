@@ -32,4 +32,8 @@ Use the **same** architecture, training budget, and val split for A vs B.
 - Full-image outputs: `gen_*/before.jpg`, `synthetic_after.jpg`, `change_mask.png`, `meta.json`
 - Batch manifest: `manifest.csv` (includes `status` such as `ok`, `empty`, `quality_reject` when quality gate is enabled)
 
+## Optional: comparing detectors / segmenters (this repo, not the val F1 test)
+
+`src/scripts/eval_detection_modes.py` is only for **developing** the SAM3 detection stack: it scores **text** vs **auto** (and optionally **SAM2.1** automatic masks via `segmentation.sam2` + `--with-sam2`) on real `before.jpg` files and writes CSV + comparison JPEGs. That does **not** replace the protocol above; it is a separate tooling track documented in [`docs/PIPELINES.md`](PIPELINES.md) and the README.
+
 This document is a **protocol only**; training code for BAN, CDMamba, ChangeMamba, etc. lives in your detector repository.

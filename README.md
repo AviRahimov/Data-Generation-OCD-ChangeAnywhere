@@ -105,6 +105,8 @@ Data-Generation-OCD-ChangeAnywhere/
       tiler.py                      # tile + reassemble utilities
       segmentation.py               # SegFormer + SAM 3 wrappers + fallback
       sam_integration.py            # SAM 3 detect_objects() + segment()
+      sam2_mask_generation.py        # optional SAM2.1 mask-generation (eval / comparison)
+      eval_comparison_viz.py        # multi-column overlays for eval_detection_modes
       inpainting.py                 # diffusion wrapper (3 backends, bbox dilation)
       change_simulator.py           # picks WHAT to change and builds the mask
       prompt_templates.py           # ADE20K -> prompts for SD
@@ -306,8 +308,11 @@ Data-Generation-OCD-ChangeAnywhere/
   change random sampling.
 
 - **[`src/scripts/eval_detection_modes.py`](src/scripts/eval_detection_modes.py)** -
-  compares SAM 3 **text** vs **auto** detection on full `before.jpg` images;
-  writes a CSV and optional side-by-side JPEGs (see [`docs/PIPELINES.md`](docs/PIPELINES.md)).
+  compares SAM 3 **text** vs **auto** (and optionally **SAM2.1** automatic masks from
+  Hugging Face `mask-generation`) on full `before.jpg` images; writes a CSV and
+  optional 2- or 3-column JPEGs (see [Evaluation](#comparing-text-auto-and-sam21)
+  and [`docs/PIPELINES.md`](docs/PIPELINES.md)). SAM2.1 is for **benchmarking
+  only**; the main generation pipeline still uses SAM 3.
 
 - **[`src/scripts/run_segment_and_generate.py`](src/scripts/run_segment_and_generate.py)** -
   simplest batch driver: runs `Pipeline.segment_tiles()` + `Pipeline.generate_synthetic()`
@@ -562,6 +567,33 @@ inpainting dominates overall wall-clock.
 unaffected because they only need the *background* class (from
 SegFormer) plus the event kind; they do not use the SAM label.
 
+**Auto tuning (SAM 3).** The `segmentation.sam.auto` block supports a separate
+`auto_detection_score_threshold` (raw box-prompt scores differ from text mode),
+`separate_seed_forward: true` (SegFormer seed boxes in their own forward pass
+before merging with the grid), optional `box_forward_batch_size` to cap VRAM,
+and `log_crop_interval` for long 8K scans. See [`src/config.yaml`](src/config.yaml).
+
+### Comparing text, auto, and SAM2.1 (eval only)
+
+The evaluation script can add a **third** column: Meta **SAM2.1** automatic masks
+(Hugging Face `mask-generation` / segment-everything style). This is **not** the
+same as SAM 3 “auto” (box-prompted grid) and is useful only for qualitative
+comparison. Configure `segmentation.sam2` in `src/config.yaml` or pass `--with-sam2`.
+
+```powershell
+python -u src/scripts/eval_detection_modes.py --with-sam2 --pairs pair_0003 `
+  --vis-dir src/data/workspace/eval_vis
+# Two columns only:   --no-sam2
+# Forcing third col:  --with-sam2  (or `sam2.enabled: true` in config)
+```
+
+Outputs `*_text_sam3auto_sam2.jpg` when SAM2.1 is active, else `*_text_vs_auto.jpg`.
+CSV includes `sam2_count`, `mean_sam2_score`, `sam2_secs` when applicable.
+For reliability, `sam2.use_bfloat16` defaults to `false` (float32);
+[`sam2_mask_generation.py`](src/pipeline/sam2_mask_generation.py) also patches
+Transformers’ AMG NMS so `torch.cat`’d IoU scores stay **1D** (required by
+`torchvision.ops.batched_nms` on some stacks).
+
 ## Configuration reference
 
 See [`src/config.yaml`](src/config.yaml). The most common knobs:
@@ -572,7 +604,9 @@ See [`src/config.yaml`](src/config.yaml). The most common knobs:
 | `segmentation.sam` | `detection_mode` | `text` uses `detection_prompts`; `auto` runs SAM 3 prompt-free and keeps meaningful masks (see *Prompt-free detection* above). |
 | `segmentation.sam` | `detection_prompts` | What SAM 3 looks for in `text` mode. Domain-specific: add "person", "pallet", etc. as needed. Ignored in `auto` mode. |
 | `segmentation.sam` | `detection_score_threshold` | Minimum SAM 3 confidence. Higher = fewer, more certain objects. |
+| `segmentation.sam.auto` | `auto_detection_score_threshold`, `separate_seed_forward`, `box_forward_batch_size`, `log_crop_interval` | Tuning for **auto** (separate from text threshold); optional per-crop progress prints. |
 | `segmentation.sam.auto` | `points_per_side`, `ignore_terrain`, `min_compactness`, `min_contrast` | Tuning knobs for `auto` mode (grid density, terrain filter, shape regularity, contrast vs. surroundings). |
+| `segmentation.sam2` | `enabled`, `checkpoint`, `points_per_batch`, `use_bfloat16`, `max_masks` | **Eval only** — optional SAM2.1 `mask-generation` column in `eval_detection_modes.py`. |
 | `inpainting` | `backend` | `sd2` / `sd15_realistic` / `sdxl`. Switches the whole pipeline. |
 | `inpainting` | `object_dilate_ratio` | Fraction of object bbox that gets added to the mask before inpainting. 0.08 = 8%. Raise if you still see halos; set to 0 to revert to fixed-size dilation. |
 | `inpainting` | `object_dilate_max_px` | Hard cap on the bbox-aware dilation. Prevents oversmoothing on huge objects. |

@@ -157,121 +157,159 @@ class SAMModel:
         return detections
 
     @torch.inference_mode()
-    def detect_objects_auto(self, pil_image, min_score=0.30,
-                            min_area_ratio=0.0005, max_area_ratio=0.15,
-                            points_per_side=16):
-        """Prompt-free "segment-everything" detection.
+    def detect_objects_auto(
+            self, pil_image, min_score=0.30,
+            min_area_ratio=0.0005, max_area_ratio=0.15,
+            points_per_side=16, box_scale=1.35, dedup_iou=0.65,
+            multi_scale=True, multi_scale_runs=None, merge_dedup_iou=0.52,
+            extra_boxes=None, separate_seed_forward=False,
+            box_forward_batch_size=0):
+        """Prompt-free grid (``input_boxes``). Optional multi-scale grids.
 
-        SAM 3's HuggingFace API requires prompts (text or boxes) -- it has
-        no native "automatic" mode like SAM 2. We approximate
-        segment-everything by feeding a dense ``points_per_side`` x
-        ``points_per_side`` grid of overlapping boxes as input prompts.
-        SAM 3's DETR decoder returns all candidate masks above the score
-        threshold; we then IoU-dedup near-duplicates.
+        ``extra_boxes`` lists [x1,y1,x2,y2] in pixel coords (e.g. SegFormer CC
+        bboxes). If ``separate_seed_forward`` is True, grid and seed boxes are
+        processed in separate forwards, then deduplicated (reduces seed dilution).
 
-        The returned dict schema is identical to ``detect_objects()`` so
-        downstream code does not need to branch:
-            mask        -- bool ndarray (H, W)
-            label       -- always "object" (no text prompt)
-            score       -- float confidence
-            area_ratio  -- float fraction of the image covered
-
-        Args:
-            pil_image: PIL RGB image
-            min_score: minimum confidence to keep a detection
-            min_area_ratio: drop masks smaller than this fraction of the image
-            max_area_ratio: drop masks larger than this fraction of the image
-            points_per_side: edge length of the box grid (16 -> 256 boxes)
+        ``box_forward_batch_size`` > 0 runs chunk forwards + merge (VRAM cap).
         """
-        dets = self._grid_auto(
-            pil_image, points_per_side=points_per_side,
-            min_score=min_score,
-            min_area_ratio=min_area_ratio,
-            max_area_ratio=max_area_ratio,
-        )
+        extra = []
+        if extra_boxes:
+            for b in extra_boxes:
+                if b is None or len(b) < 4:
+                    continue
+                extra.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+        w, h = pil_image.size
+        bsz = int(box_forward_batch_size) if box_forward_batch_size else 0
+
+        def _merge_dedup_pair(da, db, iou):
+            if not da:
+                return list(db) if db else []
+            if not db:
+                return list(da)
+            return self._dedup_by_iou(da + db, iou_thresh=float(iou))
+
+        if not multi_scale:
+            grid = self._auto_box_grid(w, h, int(points_per_side), float(box_scale))
+            if separate_seed_forward and extra:
+                dets_g = self._auto_from_boxes(
+                    pil_image, grid, min_score, min_area_ratio, max_area_ratio,
+                    float(dedup_iou), box_forward_batch_size=bsz,
+                )
+                dets_e = self._auto_from_boxes(
+                    pil_image, extra, min_score, min_area_ratio, max_area_ratio,
+                    float(dedup_iou), box_forward_batch_size=bsz,
+                )
+                dets = _merge_dedup_pair(dets_g, dets_e, merge_dedup_iou)
+            else:
+                boxes = list(grid) + extra
+                dets = self._auto_from_boxes(
+                    pil_image, boxes, min_score, min_area_ratio, max_area_ratio,
+                    float(dedup_iou), box_forward_batch_size=bsz,
+                )
+            dets.sort(key=lambda d: d["score"], reverse=True)
+            return dets
+
+        runs = multi_scale_runs
+        if not runs:
+            runs = [(1.22, 12), (1.72, 10)]
+        grid = []
+        for run in runs:
+            if not (isinstance(run, (list, tuple)) and len(run) >= 2):
+                continue
+            grid.extend(self._auto_box_grid(w, h, int(run[1]), float(run[0])))
+
+        if separate_seed_forward and extra:
+            dets_g = self._auto_from_boxes(
+                pil_image, grid, min_score, min_area_ratio, max_area_ratio,
+                float(merge_dedup_iou), box_forward_batch_size=bsz,
+            )
+            dets_e = self._auto_from_boxes(
+                pil_image, extra, min_score, min_area_ratio, max_area_ratio,
+                float(merge_dedup_iou), box_forward_batch_size=bsz,
+            )
+            dets = _merge_dedup_pair(dets_g, dets_e, merge_dedup_iou)
+        else:
+            boxes = list(grid) + extra
+            dets = self._auto_from_boxes(
+                pil_image, boxes, min_score, min_area_ratio, max_area_ratio,
+                float(merge_dedup_iou), box_forward_batch_size=bsz,
+            )
         dets.sort(key=lambda d: d["score"], reverse=True)
         return dets
 
     def _grid_auto(self, pil_image, *, points_per_side,
-                   min_score, min_area_ratio, max_area_ratio):
+                   min_score, min_area_ratio, max_area_ratio,
+                   box_scale=1.35, dedup_iou=0.65):
         """Prompt-free detection via a dense box grid.
 
         SAM 3's HuggingFace processor supports ``input_boxes`` (it does
         *not* accept ``input_points``), so we build a
         ``points_per_side`` x ``points_per_side`` grid of overlapping
-        boxes and feed them in a single forward pass. SAM 3 uses a DETR
-        decoder with a fixed number of object-query slots and returns
-        *all* candidate detections above the score threshold regardless
-        of exactly how many boxes we pass -- the boxes just act as
-        attention hints directing the decoder toward every part of the
-        image.
+        boxes and feed them in a single forward pass. ``box_scale`` > 1
+        widens each query box so the decoder sees more context, which
+        usually yields *larger* masks and less tiny-fragment noise.
 
-        Near-duplicates are collapsed by IoU NMS. Conceptually identical
-        to SAM 2's ``AutomaticMaskGenerator``, adapted for SAM 3's
-        prompt API.
+        Near-duplicates are collapsed with IoU NMS (``dedup_iou``).
         """
+        w, h = pil_image.size
+        boxes = self._auto_box_grid(w, h, int(points_per_side), float(box_scale))
+        return self._auto_from_boxes(
+            pil_image, boxes, min_score, min_area_ratio, max_area_ratio, dedup_iou)
+
+
+    def _auto_box_grid(self, w, h, pps, box_scale):
+        pps = int(pps)
+        step_x = w / float(pps)
+        step_y = h / float(pps)
+        half = float(box_scale) * 0.75 * min(step_x, step_y)
+        xs = np.linspace(step_x / 2.0, w - step_x / 2.0, pps)
+        ys = np.linspace(step_y / 2.0, h - step_y / 2.0, pps)
+        out = []
+        for y in ys:
+            for x in xs:
+                x1, y1 = max(float(x - half), 0.0), max(float(y - half), 0.0)
+                x2, y2 = min(float(x + half), float(w)), min(float(y + half), float(h))
+                out.append([x1, y1, x2, y2])
+        return out
+
+    @torch.inference_mode()
+    def _auto_forward_one_batch(
+            self, pil_image, boxes, min_score, min_area_ratio, max_area_ratio):
+        """Run one input_boxes batch; no inter-batch mask deduplication."""
+        if not boxes:
+            return []
         h = pil_image.size[1]
         w = pil_image.size[0]
         total_pixels = h * w
-
-        step_x = w / points_per_side
-        step_y = h / points_per_side
-        half = 0.75 * min(step_x, step_y)
-
-        xs = np.linspace(step_x / 2.0, w - step_x / 2.0, points_per_side)
-        ys = np.linspace(step_y / 2.0, h - step_y / 2.0, points_per_side)
-
-        boxes = []
-        for y in ys:
-            for x in xs:
-                x1 = max(float(x - half), 0.0)
-                y1 = max(float(y - half), 0.0)
-                x2 = min(float(x + half), float(w))
-                y2 = min(float(y + half), float(h))
-                boxes.append([x1, y1, x2, y2])
-
         try:
             inputs = self.processor(
-                images=pil_image,
-                input_boxes=[boxes],
-                return_tensors="pt",
-            )
+                images=pil_image, input_boxes=[boxes], return_tensors="pt")
         except Exception as e:
             print(f"  SAM3 grid auto processor error: {e}", file=sys.stderr)
             return []
-
         inputs = {k: v.to(self.device) if hasattr(v, "to") else v
                   for k, v in inputs.items()}
-
         model_dtype = next(self.model.parameters()).dtype
         if "input_boxes" in inputs and inputs["input_boxes"].dtype != model_dtype:
             inputs["input_boxes"] = inputs["input_boxes"].to(dtype=model_dtype)
-
         try:
             outputs = self.model(**inputs)
         except Exception as e:
             print(f"  SAM3 grid auto forward error: {e}", file=sys.stderr)
             return []
-
         try:
             results = self.processor.post_process_instance_segmentation(
-                outputs,
-                threshold=min_score,
-                mask_threshold=self.mask_threshold,
+                outputs, threshold=min_score, mask_threshold=self.mask_threshold,
                 target_sizes=[pil_image.size[::-1]],
             )
         except Exception as e:
             print(f"  SAM3 grid auto post-process error: {e}", file=sys.stderr)
             return []
-
         if not results:
             return []
-
-        masks = results[0].get("masks")
-        scores = results[0].get("scores")
+        masks, scores = results[0].get("masks"), results[0].get("scores")
         if masks is None or scores is None:
             return []
-
         dets = []
         for m, s in zip(masks, scores):
             score_val = (float(s.cpu()) if hasattr(s, "cpu") else float(s))
@@ -283,13 +321,33 @@ class SAMModel:
             if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
                 continue
             dets.append({
-                "mask": m_np,
-                "label": "object",
-                "score": score_val,
+                "mask": m_np, "label": "object", "score": score_val,
                 "area_ratio": float(area_ratio),
             })
+        return dets
 
-        return self._dedup_by_iou(dets, iou_thresh=0.7)
+    @torch.inference_mode()
+    def _auto_from_boxes(
+            self, pil_image, boxes, min_score, min_area_ratio, max_area_ratio,
+            dedup_iou, box_forward_batch_size=0):
+        if not boxes:
+            return []
+        bsz = int(box_forward_batch_size) if box_forward_batch_size else 0
+        if bsz > 0 and len(boxes) > bsz:
+            merged = []
+            for i in range(0, len(boxes), bsz):
+                chunk = boxes[i:i + bsz]
+                merged.extend(
+                    self._auto_forward_one_batch(
+                        pil_image, chunk, min_score, min_area_ratio, max_area_ratio
+                    )
+                )
+            dets = merged
+        else:
+            dets = self._auto_forward_one_batch(
+                pil_image, boxes, min_score, min_area_ratio, max_area_ratio
+            )
+        return self._dedup_by_iou(dets, iou_thresh=float(dedup_iou))
 
     @staticmethod
     def _dedup_by_iou(dets, iou_thresh=0.7):

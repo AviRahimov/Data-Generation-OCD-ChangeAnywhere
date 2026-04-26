@@ -34,20 +34,90 @@ segmentation:
     detection_prompts: ["rock", "person", "car", "box", "bag", "bush"]
     detection_score_threshold: 0.30
     auto:
-      # 16x16 = 256 foreground seed points on each 1024-px scan crop.
-      # Higher => slower but finds smaller objects; lower => faster but misses detail.
+      # Multi-scale: two SAM forward passes (no text) with different box grids.
+      multi_scale: true
+      multi_scale_runs:
+        - [1.28, 13]
+        - [1.8, 10]
+      merge_dedup_iou: 0.52
+      # SegFormer non-terrain CCs as extra SAM input_boxes (no text prompts).
+      segformer_seed_boxes: true
+      seed_min_cc_pixels: 350
+      seed_margin_px: 10
+      max_seed_boxes: 14
+      # Optional second full-image pass (not implemented): reserved for future coarse grid.
+      coarse_pass: false
+      # SAM3 auto grid score (box-prompt path); not the same as text; leave unset to use detection_score_threshold.
+      auto_detection_score_threshold: 0.22
+      # True = SegFormer seed boxes in a separate forward from the box grid (recommended).
+      separate_seed_forward: true
+      # 0 = all boxes in one forward; 16–32 may reduce peak VRAM on large grids.
+      box_forward_batch_size: 0
+      # 0 = off. e.g. 5 prints a heartbeat every N tile iterations on large 8K scans.
+      log_crop_interval: 0
+      # After per-crop filters: keep top-N by objectness per tile; then NMS + MMR across the full image.
+      max_detections_per_crop: 10
+      max_global_candidates: 150
+      nms_iou: 0.35
+      use_mmr: true
+      mmr_lambda: 0.55
+      # Drop tiny bboxes from the MMR pool (full-image px); 0 = off. Favor larger salient regions.
+      mmr_min_bbox_area_px: 2200
       points_per_side: 16
-      # Drop masks whose dominant SegFormer class is ground/grass/sand/etc.
-      # Otherwise "segment everything" returns big terrain blobs that aren't
-      # useful objects. Advanced users can set to false for debugging.
+      box_scale: 1.35
+      dedup_iou: 0.65
       ignore_terrain: true
-      # Drop masks smaller/larger than these fractions of the scan crop.
-      min_area_ratio: 0.0005
+      min_area_ratio: 0.0025
       max_area_ratio: 0.15
-      # Advanced tuning: shape regularity (1.0 = circle, 0 = stringy) and
-      # how distinct the mask is from its immediate surroundings.
-      min_compactness: 0.25
+      min_area_ratio_post: 0.0021
+      # Reject "uniform soil" specks: min variance of gray inside mask (0-255 scale).
+      min_mask_interior_variance: 95.0
+      # Drop axis-aligned bboxes with shortest side under this (pixels).
+      min_short_side_px: 25
+      # Reject masks that are almost entirely SegFormer terrain classes.
+      max_terrain_pixel_fraction: 0.85
+      # Require a minimum fraction of mask pixels to be non-terrain (complements max_terrain_pixel_fraction).
+      min_non_terrain_class_fraction: 0.18
+      # L*a*b* ring vs interior: rejects soil-on-soil that only differs in gray (shadows / furrows).
+      min_lab_ring_distance: 6.0
+      # "and" = gray ring contrast and Lab delta E must both pass (when min_lab_ring_distance > 0).
+      color_contrast_mode: "and"
+      # Wider halo = stabler mean color of "surroundings" vs a 1-furrow-wide ring.
+      ring_contrast_px: 6
+      # Optional: require |chroma(ins) - chroma(ring)|; 0 = off. Useful if Lab alone is not enough.
+      min_chroma_ring_delta: 0.0
+      # 1.0 = off. Lower = stricter: reject if ring vs inside RGB histograms are too similar (soil texture).
+      max_ring_histogram_bc: 0.94
+      # Drop very low SAM confidence; keep ~0.35 (e.g. shadowed vegetation) if other gates pass.
+      min_sam_mask_score: 0.34
+      # Optional absolute mask area in pixels; 0 = off. Use with objectness ranking, not as only gate.
+      min_mask_area_pixels: 0
+      # Mean |grad| on mask boundary band vs eroded core. 0 = off (ranking still uses the ratio in objectness).
+      min_edge_interior_grad_ratio: 0.0
+      edge_grad_erode: 2
+      ring_hist_bin_per_ch: 8
+      # Object-like ADE20K ids (null = do not use allowlist; rely on terrain + color gates above)
+      object_class_allowlist: null
+      min_compactness: 0.22
       min_contrast: 8.0
+      objectness_weights:
+        area_log_weight: 0.85
+        min_area_ratio_target: 0.004
+        tiny_area_penalty: 1.2
+        non_terrain_weight: 2.5
+  # SAM2.1 for eval comparisons only (see scripts/eval_detection_modes.py); not used in generate_pair.
+  sam2:
+    enabled: false
+    checkpoint: "facebook/sam2.1-hiera-base-plus"
+    device: "cuda"
+    # false = float32 (recommended; AMG NMS in torchvision is most reliable in fp32).
+    use_bfloat16: false
+    points_per_batch: 32
+    max_masks: 45
+    min_area_ratio: 0.0001
+    max_area_ratio: 0.90
+    run_on_vis_resolution: true
+    pipeline_kwargs: {}
 
 inpainting:
   backend: "sd2"             # "sd2" | "sd15_realistic" | "sdxl"

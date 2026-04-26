@@ -1,21 +1,13 @@
-"""Evaluate text-mode vs auto-mode detection across a sample of pairs.
+"""Compare SAM3 text vs SAM3 auto; optional column: SAM2.1 automatic masks.
 
-Runs `select_best_objects` in BOTH detection modes on the full `before.jpg`
-of each sampled pair, records per-pair detection counts and spatial overlaps,
-and writes a CSV + printed summary so you (or the supervisor) can judge
-whether auto mode provides useful "novel" coverage beyond the fixed text
-prompt list.
+See ``segmentation.sam.auto`` and ``segmentation.sam2`` in ``config.yaml``.
+CLI: ``--with-sam2``, ``--no-sam2``. Multi-column figure saved as
+``*_text_sam3auto_sam2.jpg`` when SAM2.1 is active, else ``*_text_vs_auto.jpg``.
 
 Examples:
     python -u src/scripts/eval_detection_modes.py --num-pairs 20 \\
         --output src/data/workspace/eval_text_vs_auto.csv
-
-    # Regenerate side-by-side images for specific pairs (CSV + JPGs):
-    python -u src/scripts/eval_detection_modes.py \\
-        --pairs pair_0003,pair_0014 \\
-        --output src/data/workspace/eval_text_vs_auto_smoke.csv
-
-    # Skip JPGs to save time / disk:
+    python -u src/scripts/eval_detection_modes.py --with-sam2 --pairs pair_0003
     python -u src/scripts/eval_detection_modes.py --vis-dir ""
 """
 import sys
@@ -36,46 +28,29 @@ import random
 import time
 from statistics import mean, median
 
-import numpy as np
-
 try:
     import torch
 except ImportError:
     torch = None
 import yaml
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 from pipeline.config import Config
+from pipeline.eval_comparison_viz import (
+    COLOR_AUTO,
+    COLOR_SAM2,
+    COLOR_TEXT,
+    build_multi_column_panel,
+    downscale_for_vis,
+)
+from pipeline.sam2_mask_generation import (
+    build_sam2_mask_pipeline,
+    promote_dets_to_full_space,
+    sam2_detections_on_image,
+    sam2_is_configured,
+)
 from pipeline.segmentation import get_segmentation_model
 from pipeline.synthetic import select_best_objects
-
-
-TEXT_COLOR = (255, 70, 70)   # red for text-mode detections
-AUTO_COLOR = (70, 140, 255)  # blue for auto-mode detections
-PANEL_TITLE_H = 56
-
-
-def _font(size=24):
-    for p in [
-        "C:/Windows/Fonts/arialbd.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]:
-        try:
-            return ImageFont.truetype(p, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-def _downscale_for_vis(pil_image, target_width=1200):
-    """Resize to a manageable size for per-pair visualizations."""
-    w, h = pil_image.size
-    if w <= target_width:
-        return pil_image, 1.0
-    scale = target_width / w
-    new_size = (target_width, int(h * scale))
-    return pil_image.resize(new_size, Image.LANCZOS), scale
 
 
 def _cuda_gc():
@@ -83,75 +58,6 @@ def _cuda_gc():
     gc.collect()
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-def _overlay_detections(base_pil, dets, color, scale):
-    """Draw mask fills + bbox outlines + labels for a detection list.
-
-    ``scale`` is the image downscale factor (dets are in full-image coords).
-    """
-    out = base_pil.copy().convert("RGBA")
-    overlay = Image.new("RGBA", out.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    font = _font(20)
-
-    color_fill = (*color, 90)
-    color_line = (*color, 255)
-
-    for i, d in enumerate(dets, 1):
-        mask = d.get("mask_fullimg")
-        if mask is not None:
-            mask_small = np.array(Image.fromarray(
-                (mask.astype(np.uint8) * 255)
-            ).resize(out.size, Image.NEAREST))
-            alpha = np.zeros(out.size[::-1] + (4,), dtype=np.uint8)
-            fill = np.array(color_fill, dtype=np.uint8)
-            alpha[mask_small > 127] = fill
-            overlay = Image.alpha_composite(overlay, Image.fromarray(alpha))
-            draw = ImageDraw.Draw(overlay)
-
-        bx1, by1, bx2, by2 = d["bbox_fullimg"]
-        sx1, sy1 = int(bx1 * scale), int(by1 * scale)
-        sx2, sy2 = int(bx2 * scale), int(by2 * scale)
-        draw.rectangle([sx1, sy1, sx2, sy2], outline=color_line, width=3)
-        label = f"{i}. {d.get('label', '?')} {d.get('score', 0):.2f}"
-        tw = (draw.textlength(label, font=font)
-              if hasattr(draw, "textlength")
-              else (draw.textbbox((0, 0), label, font=font)[2]
-                    - draw.textbbox((0, 0), label, font=font)[0]))
-        draw.rectangle([sx1, max(sy1 - 24, 0), sx1 + tw + 8, max(sy1, 24)],
-                       fill=color_line)
-        draw.text((sx1 + 4, max(sy1 - 22, 2)), label, fill=(255, 255, 255), font=font)
-
-    out = Image.alpha_composite(out, overlay).convert("RGB")
-    return out
-
-
-def _build_comparison_panel(before_pil, text_dets, auto_dets, pair_id, scale):
-    """Return a side-by-side (text | auto) comparison panel with titles."""
-    title_font = _font(30)
-    small_font = _font(22)
-
-    left = _overlay_detections(before_pil, text_dets, TEXT_COLOR, scale)
-    right = _overlay_detections(before_pil, auto_dets, AUTO_COLOR, scale)
-
-    pw, ph = left.size
-    gap = 12
-    out_w = pw * 2 + gap
-    out_h = ph + PANEL_TITLE_H + 36
-    canvas = Image.new("RGB", (out_w, out_h), (25, 25, 25))
-
-    draw = ImageDraw.Draw(canvas)
-    draw.text((16, 12), f"{pair_id}", fill=(255, 255, 255), font=title_font)
-    left_title = f"text mode ({len(text_dets)} objs)"
-    right_title = f"auto mode ({len(auto_dets)} objs)"
-    draw.text((16, PANEL_TITLE_H - 8), left_title, fill=TEXT_COLOR, font=small_font)
-    draw.text((pw + gap + 16, PANEL_TITLE_H - 8), right_title,
-              fill=AUTO_COLOR, font=small_font)
-
-    canvas.paste(left, (0, PANEL_TITLE_H + 24))
-    canvas.paste(right, (pw + gap, PANEL_TITLE_H + 24))
-    return canvas
 
 
 def _bbox_iou(a, b):
@@ -208,7 +114,8 @@ def _match_counts(text_summary, auto_summary, iou_threshold):
     return matched, auto_novel, text_only
 
 
-def run_mode(mode, before_full, sam_model, seg_model, sam_cfg, syn_cfg, asm_cfg):
+def run_mode(mode, before_full, sam_model, seg_model, sam_cfg, syn_cfg, asm_cfg,
+             debug_detection_stages=None):
     """Run select_best_objects in one mode, returning detections + timing."""
     detection_prompts = sam_cfg.get("detection_prompts",
                                     ["rock", "person", "car", "box", "bag", "bush"])
@@ -239,6 +146,7 @@ def run_mode(mode, before_full, sam_model, seg_model, sam_cfg, syn_cfg, asm_cfg)
         detection_mode=mode,
         seg_model=seg_model,
         auto_cfg=auto_cfg,
+        debug_detection_stages=debug_detection_stages,
     )
     elapsed = time.time() - t0
     return dets, elapsed
@@ -246,7 +154,7 @@ def run_mode(mode, before_full, sam_model, seg_model, sam_cfg, syn_cfg, asm_cfg)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare text-mode vs auto-mode detection on N sample pairs.",
+        description="Compare SAM3 text vs SAM3 auto; optional SAM2.1 automask column.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--input-dir", default=None,
@@ -273,10 +181,28 @@ def main():
              "to evaluate instead of random sampling. Use this to regenerate "
              "visuals for specific pairs.",
     )
+    parser.add_argument(
+        "--debug-detection-stages",
+        action="store_true",
+        help="Print SAM vs post_filter vs NMS/MMR stage counts (auto) and text "
+             "pre-NMS count. Same as sam.auto.log_detection_stages in config.",
+    )
+    s2 = parser.add_mutually_exclusive_group()
+    s2.add_argument(
+        "--with-sam2",
+        action="store_true",
+        help="Add SAM2.1 automatic mask column (overrides config if set).",
+    )
+    s2.add_argument(
+        "--no-sam2",
+        action="store_true",
+        help="Force-disable SAM2.1 even if enabled in config.",
+    )
     args = parser.parse_args()
+    # None = honor sam.auto.log_detection_stages; True = force verbose.
+    eval_debug_stages = True if args.debug_detection_stages else None
 
     cfg = Config("src/config.yaml")
-    yml = yaml.safe_load(cfg.path.open().read())
 
     input_dir = Path(args.input_dir) if args.input_dir else Path(cfg.data["raw_root"])
     if not input_dir.exists():
@@ -311,8 +237,16 @@ def main():
         print(f"Sampled {n}/{len(pairs)} pairs (seed={args.seed}).")
 
     sam_cfg = cfg.segmentation.get("sam", {})
+    sam2_cfg = cfg.segmentation.get("sam2") or {}
     syn_cfg = cfg.synthetic
     asm_cfg = cfg.assembler
+
+    if args.no_sam2:
+        use_sam2 = False
+    elif args.with_sam2:
+        use_sam2 = True
+    else:
+        use_sam2 = sam2_is_configured(sam2_cfg)
 
     print("Loading SAM 3...")
     sam_model = get_segmentation_model("sam", cfg.segmentation)
@@ -320,6 +254,17 @@ def main():
     seg_model = get_segmentation_model(
         cfg.segmentation.get("active_model", "segformer"), cfg.segmentation
     )
+
+    sam2_pipe = None
+    if use_sam2:
+        print("Loading SAM2.1 (mask-generation pipeline)...")
+        sam2_pipe, err = build_sam2_mask_pipeline(sam2_cfg)
+        if sam2_pipe is None:
+            print(f"  SAM2.1 disabled (load failed): {err}")
+            use_sam2 = False
+        else:
+            print("  SAM2.1 ready.")
+        _cuda_gc()
 
     if torch is not None and torch.cuda.is_available():
         try:
@@ -345,6 +290,7 @@ def main():
         "text_count": 0, "auto_count": 0,
         "matched": 0, "auto_novel": 0, "text_only": 0,
         "text_secs": 0.0, "auto_secs": 0.0,
+        "sam2_count": 0, "sam2_secs": 0.0,
     }
 
     out_path = Path(args.output)
@@ -352,7 +298,8 @@ def main():
     fieldnames = [
         "pair_id", "text_count", "auto_count", "matched", "auto_novel",
         "text_only", "mean_text_score", "mean_auto_score", "text_labels",
-        "text_secs", "auto_secs",
+        "text_secs", "auto_secs", "sam2_count", "mean_sam2_score",
+        "sam2_secs",
     ]
     csv_file = out_path.open("w", newline="", encoding="utf-8")
     try:
@@ -370,6 +317,7 @@ def main():
             text_dets, text_secs = run_mode(
                 "text", before_full, sam_model, seg_model,
                 sam_cfg, syn_cfg, asm_cfg,
+                debug_detection_stages=eval_debug_stages,
             )
             print(f"    -> {len(text_dets)} objs in {text_secs:.1f}s")
             _cuda_gc()
@@ -378,12 +326,37 @@ def main():
             auto_dets, auto_secs = run_mode(
                 "auto", before_full, sam_model, seg_model,
                 sam_cfg, syn_cfg, asm_cfg,
+                debug_detection_stages=eval_debug_stages,
             )
             print(f"    -> {len(auto_dets)} objs in {auto_secs:.1f}s")
             _cuda_gc()
 
+            sam2_dets = []
+            sam2_secs = 0.0
+            if use_sam2 and sam2_pipe is not None:
+                print("  SAM2.1 automask...")
+                t2 = time.time()
+                before_small, _vscale = downscale_for_vis(
+                    before_full, args.vis_width)
+                sw, sh = before_small.size
+                fw, fh = before_full.size
+                if sam2_cfg.get("run_on_vis_resolution", True):
+                    sam2_dets = sam2_detections_on_image(
+                        before_small, sam2_pipe, sam2_cfg)
+                    sam2_dets = promote_dets_to_full_space(
+                        sam2_dets, sw, sh, fw, fh)
+                else:
+                    sam2_dets = sam2_detections_on_image(
+                        before_full, sam2_pipe, sam2_cfg)
+                sam2_secs = time.time() - t2
+                print(f"    -> {len(sam2_dets)} masks in {sam2_secs:.1f}s")
+                _cuda_gc()
+
             text_summary = _summarize(text_dets)
             auto_summary = _summarize(auto_dets)
+            sam2_summary = _summarize(sam2_dets) if use_sam2 else {
+                "count": 0, "mean_score": 0.0, "bboxes": [], "labels": [],
+            }
             matched, auto_novel, text_only = _match_counts(
                 text_summary, auto_summary, args.iou_threshold
             )
@@ -400,6 +373,9 @@ def main():
                 "text_labels": "|".join(text_summary["labels"]),
                 "text_secs": round(text_secs, 1),
                 "auto_secs": round(auto_secs, 1),
+                "sam2_count": sam2_summary["count"],
+                "mean_sam2_score": round(sam2_summary["mean_score"], 3),
+                "sam2_secs": round(sam2_secs, 1),
             }
             rows.append(row)
             csv_writer.writerow(row)
@@ -412,15 +388,30 @@ def main():
             totals["text_only"] += text_only
             totals["text_secs"] += text_secs
             totals["auto_secs"] += auto_secs
+            totals["sam2_count"] += sam2_summary["count"]
+            totals["sam2_secs"] += sam2_secs
 
             if vis_dir:
                 try:
-                    before_small, scale = _downscale_for_vis(
+                    before_small, scale = downscale_for_vis(
                         before_full, args.vis_width)
-                    panel = _build_comparison_panel(
-                        before_small, text_dets, auto_dets, pair_dir.name, scale
+                    if use_sam2 and sam2_pipe is not None:
+                        cols = [
+                            ("text", text_dets, COLOR_TEXT),
+                            ("SAM3 auto", auto_dets, COLOR_AUTO),
+                            ("SAM2.1 auto", sam2_dets, COLOR_SAM2),
+                        ]
+                        vis_name = f"{pair_dir.name}_text_sam3auto_sam2.jpg"
+                    else:
+                        cols = [
+                            ("text", text_dets, COLOR_TEXT),
+                            ("SAM3 auto", auto_dets, COLOR_AUTO),
+                        ]
+                        vis_name = f"{pair_dir.name}_text_vs_auto.jpg"
+                    panel = build_multi_column_panel(
+                        before_small, cols, pair_dir.name, scale,
                     )
-                    panel_path = vis_dir / f"{pair_dir.name}_text_vs_auto.jpg"
+                    panel_path = vis_dir / vis_name
                     panel.save(panel_path, quality=85)
                     print(f"    vis saved: {panel_path.name}")
                 except Exception as e:
@@ -430,14 +421,18 @@ def main():
                         _d.pop("mask_fullimg", None)
                     for _d in auto_dets:
                         _d.pop("mask_fullimg", None)
+                    for _d in sam2_dets:
+                        _d.pop("mask_fullimg", None)
                     _cuda_gc()
             else:
                 for _d in text_dets:
                     _d.pop("mask_fullimg", None)
                 for _d in auto_dets:
                     _d.pop("mask_fullimg", None)
+                for _d in sam2_dets:
+                    _d.pop("mask_fullimg", None)
 
-            del before_full, text_dets, auto_dets
+            del before_full, text_dets, auto_dets, sam2_dets
             _cuda_gc()
 
     finally:
@@ -464,7 +459,11 @@ def main():
     print(f"  novel-rate:       {novel_rate:.1%} of auto detections were NOT "
           f"found by text mode")
     print(f"  avg time/pair:    text={totals['text_secs']/n:.1f}s  "
-          f"auto={totals['auto_secs']/n:.1f}s")
+          f"auto={totals['auto_secs']/n:.1f}s", end="")
+    if totals.get("sam2_count", 0) > 0 or totals.get("sam2_secs", 0) > 0:
+        print(f"  sam2.1={totals['sam2_secs']/n:.1f}s")
+    else:
+        print()
     print(f"\n  CSV written:      {out_path}")
 
 

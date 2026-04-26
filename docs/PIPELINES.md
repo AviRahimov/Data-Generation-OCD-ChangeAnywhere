@@ -26,11 +26,14 @@ python src/scripts/generate_dataset.py `
 
 Useful options:
 
-- `--detection-mode text` or `--detection-mode auto` (overrides `config.yaml` `segmentation.sam.detection_mode`).
+- `--detection-mode text` or `--detection-mode auto` (overrides `config.yaml` `segmentation.sam.detection_mode`). For **auto**, tune `segmentation.sam.auto` in `src/config.yaml` (`auto_detection_score_threshold`, `separate_seed_forward`, `box_forward_batch_size`, `log_crop_interval`, etc.). **Multi-scale** can use two `box_scale` / `points_per_side` runs; with `separate_seed_forward: true` (default) SegFormer **seed** boxes and the **grid** are merged after separate forwards. **Post-filters** (no text to SAM) include `min_mask_interior_variance` (drop flat soil), `max_terrain_pixel_fraction` / `min_short_side_px` (drop specks), plus `min_area_ratio` and optional `object_class_allowlist` (ADE20K ids; set to `null` to disable that filter). Also tune `box_scale` / `dedup_iou` for grid behavior.
 - `--backend sd2` / `sd15_realistic` / `sdxl` (overrides inpaint backend).
+- `--source-frames before` / `after` / `both` — for `pair_*` folders, which real frames to draw from (`both` doubles the pool; manifest gets `source_frame`). Flat image folders always tag `before`.
 - `--save-overview` — extra `overview.png` per sample.
 - `--no-comparison` — skip `comparison.png`.
 - `--config path\to\config.yaml` — non-default config.
+
+After each sample the driver runs `gc.collect()` and `torch.cuda.empty_cache()` when CUDA is available to reduce fragmentation.
 
 Optional quality gate: in `src/config.yaml` set `synthetic.full_image_quality.enabled: true` (local SSIM on the change region; rejected samples get `manifest` status `quality_reject` and no output folder).
 
@@ -77,9 +80,11 @@ cd /path/to/Data-Generation-OCD-ChangeAnywhere
 PYTHONPATH=src python -m pipeline.dataset
 ```
 
-### 5. Evaluation: text vs auto SAM (`eval_detection_modes.py`)
+### 5. Evaluation: SAM3 text vs SAM3 auto (optional SAM2.1 column)
 
-Random sample of N pairs from `data.raw_root` (or set `--input-dir`), full `before.jpg` only — no inpainting.
+Random sample of N pairs from `data.raw_root` (or set `--input-dir`), full `before.jpg` only — no inpainting. Compares `select_best_objects` in **text** and **auto** modes. Optionally adds a **third** panel using Hugging Face **`mask-generation`** (Meta SAM2.1, e.g. `facebook/sam2.1-hiera-base-plus`) for **qualitative** comparison only; it is not used by `generate_pair` / `generate_dataset`.
+
+**Config:** set `segmentation.sam2.enabled: true` in `src/config.yaml`, and tune `segmentation.sam2` (`checkpoint`, `points_per_batch`, `max_masks`, `use_bfloat16: false` recommended, `run_on_vis_resolution: true` to run on the same downscale as the JPEG to save VRAM). **CLI:** `--with-sam2` forces the third column; `--no-sam2` disables it even if enabled in config.
 
 ```powershell
 python -u src/scripts/eval_detection_modes.py `
@@ -87,6 +92,9 @@ python -u src/scripts/eval_detection_modes.py `
   --output src/data/workspace/eval_text_vs_auto.csv `
   --vis-dir src/data/workspace/eval_vis `
   --seed 42
+
+# Three columns (SAM2.1): either enable in config or:
+python -u src/scripts/eval_detection_modes.py --with-sam2 --pairs pair_0003 --vis-dir src/data/workspace/eval_vis
 ```
 
 Explicit pairs (e.g. regenerate visuals for a smoke list):
@@ -97,6 +105,10 @@ python -u src/scripts/eval_detection_modes.py `
   --output src/data/workspace/eval_smoke.csv `
   --vis-dir src/data/workspace/eval_vis_smoke
 ```
+
+- **Vis filenames:** `pair_*_text_sam3auto_sam2.jpg` when SAM2.1 is active, else `pair_*_text_vs_auto.jpg`.
+- **CSV:** includes `sam2_count`, `mean_sam2_score`, `sam2_secs` (zeros when SAM2.1 is off).
+- **Debug (SAM3 auto stages):** `--debug-detection-stages` or `sam.auto.log_detection_stages: true`.
 
 Disable JPEG panels (CSV only): `--vis-dir ""`.
 
@@ -134,7 +146,7 @@ Functions [`batch_generate`](../src/pipeline/tile_synthetic.py) and [`generate_s
 
 ## Evaluation (not training)
 
-- [`src/scripts/eval_detection_modes.py`](../src/scripts/eval_detection_modes.py): compares SAM **text** vs **auto** detection on full `before.jpg` images; writes CSV and optional side-by-side JPEGs.
+- [`src/scripts/eval_detection_modes.py`](../src/scripts/eval_detection_modes.py): compares SAM3 **text** vs **auto**; optional **SAM2.1** `mask-generation` column (see section 5). Overlays are built by [`src/pipeline/eval_comparison_viz.py`](../src/pipeline/eval_comparison_viz.py). SAM2.1 integration and a small Transformers NMS patch live in [`src/pipeline/sam2_mask_generation.py`](../src/pipeline/sam2_mask_generation.py).
 
 ## Related docs
 

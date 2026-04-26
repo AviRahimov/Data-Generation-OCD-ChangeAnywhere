@@ -17,8 +17,12 @@ Models (SAM 3 + SegFormer + inpainter) are loaded ONCE at startup and reused
 for every iteration -- loading them per-sample would dominate runtime.
 
 Auto-detects two input layouts:
-  - pair_*/before.jpg (our repo layout)
+  - pair_*/before.jpg (and optionally after.jpg via --source-frames)
   - a flat folder of .jpg / .jpeg / .png files
+
+Each manifest row includes ``source_frame`` (``before`` or ``after``) for
+pair-layout runs. After each sample the driver calls ``gc.collect()`` and
+``torch.cuda.empty_cache()`` when CUDA is available to reduce fragmentation.
 
 Example:
     python src/scripts/generate_dataset.py `
@@ -35,6 +39,7 @@ sys.path.insert(0, str(_HERE.parents[0]))  # scripts/ -> for `generate_pair.buil
 
 import argparse
 import csv
+import gc
 import random
 import shutil
 import time
@@ -105,50 +110,89 @@ def parse_args():
     p.add_argument("--overview-width", type=int, default=None,
                    help="Width of saved overview thumbnails (defaults to "
                         "assembler.overview_width in config).")
+    p.add_argument(
+        "--source-frames",
+        choices=["before", "after", "both"],
+        default="before",
+        help="Which real frames to use from pair_* folders: before.jpg only, "
+             "after.jpg only, or both (doubles the pool). Ignored for flat "
+             "image folders (each file is tagged as 'before').",
+    )
     return p.parse_args()
 
 
-def discover_inputs(root: Path):
-    """Return a list of Paths pointing to 'before' images.
+def discover_inputs(root: Path, source_frames: str = "before"):
+    """Return a list of (image_path, source_frame) with source_frame
+    ``before`` or ``after``.
 
     Priority:
-      1. If root contains pair_*/before.jpg folders, use those.
-      2. Otherwise recursively glob image files under root.
+      1. pair_* layout: before.jpg and/or after.jpg per ``source_frames``.
+      2. Otherwise recursively glob image files (each tagged ``before``).
     Raises FileNotFoundError if neither layout yields anything.
     """
     if not root.exists():
         raise FileNotFoundError(f"Input directory does not exist: {root}")
 
-    pair_befores = sorted(root.glob("pair_*/before.jpg"))
-    if pair_befores:
-        return pair_befores
+    pair_dirs = sorted(
+        p for p in root.iterdir()
+        if p.is_dir() and p.name.startswith("pair_")
+    )
+    if pair_dirs:
+        out = []
+        for d in pair_dirs:
+            b = d / "before.jpg"
+            a = d / "after.jpg"
+            if source_frames in ("before", "both") and b.exists():
+                out.append((b, "before"))
+            if source_frames in ("after", "both") and a.exists():
+                out.append((a, "after"))
+        if out:
+            return out
 
+    if source_frames in ("after", "both"):
+        print(
+            "  [warn] --source-frames after/both with flat image folder: "
+            "using all images as sources tagged 'before'.",
+            flush=True,
+        )
     flat = []
     for p in root.rglob("*"):
         if p.is_file() and p.suffix in IMG_EXTS:
-            flat.append(p)
-    flat.sort()
+            flat.append((p, "before"))
+    flat.sort(key=lambda t: str(t[0]))
     if flat:
         return flat
 
     raise FileNotFoundError(
-        f"No images found under {root}. Expected either pair_*/before.jpg or "
-        f"a folder of .jpg/.jpeg/.png files."
+        f"No images found under {root}. Expected pair_*/before.jpg (and "
+        f"optionally after.jpg) or a folder of .jpg/.jpeg/.png files."
     )
 
 
-def balanced_draws(inputs, n, rng):
-    """Return a length-n list where each item in ``inputs`` appears either
+def balanced_draws(items, n, rng):
+    """Return a length-n list where each item in ``items`` appears either
     floor(n/k) or ceil(n/k) times. Order is shuffled."""
-    k = len(inputs)
+    k = len(items)
+    if k == 0:
+        return []
     base, rem = divmod(n, k)
     draws = []
-    for path in inputs:
-        draws.extend([path] * base)
-    extras = rng.sample(list(inputs), rem) if rem > 0 else []
+    for item in items:
+        draws.extend([item] * base)
+    extras = rng.sample(list(items), rem) if rem > 0 else []
     draws.extend(extras)
     rng.shuffle(draws)
     return draws
+
+
+def _cuda_gc():
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _bbox_from_mask(mask_bool):
@@ -296,7 +340,7 @@ def main():
     if args.max_objects < args.min_objects:
         raise ValueError("--max-objects must be >= --min-objects")
 
-    inputs = discover_inputs(args.input_dir)
+    inputs = discover_inputs(args.input_dir, args.source_frames)
     draws = balanced_draws(inputs, args.n_images, master_rng)
     k_inputs = len(inputs)
 
@@ -305,7 +349,8 @@ def main():
     manifest_exists = manifest_path.exists()
 
     print(f"=== Batch dataset generation ===")
-    print(f"  input-dir     : {args.input_dir}  ({k_inputs} images found)")
+    print(f"  input-dir     : {args.input_dir}  ({k_inputs} source frames, "
+          f"--source-frames {args.source_frames})")
     print(f"  output-dir    : {args.output_dir}")
     print(f"  n-images      : {args.n_images}")
     print(f"  objects/image : {args.min_objects}..{args.max_objects}")
@@ -358,7 +403,7 @@ def main():
     manifest_writer = csv.writer(manifest_f)
     if not manifest_exists:
         manifest_writer.writerow([
-            "id", "source_path", "n_requested", "n_applied",
+            "id", "source_path", "source_frame", "n_requested", "n_applied",
             "n_add_requested", "n_add_applied",
             "n_remove_requested", "n_remove_applied",
             "labels", "status", "elapsed_s",
@@ -367,7 +412,8 @@ def main():
 
     # --- Main loop ---
     try:
-        for i, src_path in enumerate(tqdm(draws, desc="Generating", unit="pair")):
+        for i, (src_path, source_frame) in enumerate(
+                tqdm(draws, desc="Generating", unit="pair")):
             gen_id = f"gen_{i:05d}"
             start = time.time()
             sample_rng = random.Random(args.seed + 1 + i)
@@ -461,12 +507,14 @@ def main():
                     labels = ";".join(
                         m["label"] for m in meta_entries) if meta_entries else ""
                     manifest_writer.writerow([
-                        gen_id, str(src_path), n_total, len(meta_entries),
+                        gen_id, str(src_path), source_frame, n_total,
+                        len(meta_entries),
                         n_add_req, n_add_applied,
                         n_rem_req, n_rem_applied,
                         labels, status, f"{elapsed:.1f}",
                     ])
                     manifest_f.flush()
+                    _cuda_gc()
                     continue
 
                 out_dir = args.output_dir / gen_id
@@ -483,6 +531,7 @@ def main():
                 write_json({
                     "id": gen_id,
                     "source_path": str(src_path),
+                    "source_frame": source_frame,
                     "full_size": list(before_full.size),
                     "n_requested": n_total,
                     "n_applied": len(meta_entries),
@@ -532,12 +581,13 @@ def main():
             labels = ";".join(m["label"] for m in meta_entries) if meta_entries else ""
 
             manifest_writer.writerow([
-                gen_id, str(src_path), n_total, len(meta_entries),
+                gen_id, str(src_path), source_frame, n_total, len(meta_entries),
                 n_add_req, n_add_applied,
                 n_rem_req, n_rem_applied,
                 labels, status, f"{elapsed:.1f}",
             ])
             manifest_f.flush()
+            _cuda_gc()
     finally:
         manifest_f.close()
         inpaint.cleanup()
